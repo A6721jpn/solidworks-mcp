@@ -1,20 +1,26 @@
 # solidworks-mcp
 
+> This is A6721jpn's modified fork of
+> [solidworks-mcp by JIALE LIU](https://github.com/Slacker-LLC/solidworks-mcp),
+> based on upstream commit `6019ce0`. It adds batch scripts, snapshots,
+> model diffs, persistent selection references, and dialog handling.
+> See [FORK.md](FORK.md) for the changes, configuration, and limitations.
+
 An MCP server that drives a **running** SOLIDWORKS session over its COM API.
 
-It does not launch SOLIDWORKS, register an add-in, execute arbitrary code, or
-touch the network. It attaches to a session you already have open and calls the
-documented API — so if a tool can't do something, neither could a macro.
+It attaches to an existing SOLIDWORKS session through its COM API.
+This fork also runs caller-supplied Python through `run_script` and recipes.
+Those scripts have the operating-system permissions of the server process.
+Use a trusted local MCP host. Set `SW_MCP_ALLOW_SCRIPTS=0` to disable them.
+The output-directory restriction applies to standard tools, not arbitrary scripts.
 
-92 tools: sketching with real relations and driving dimensions, the solid
-features you actually reach for, reference geometry, assemblies and mates, and —
-importantly — a feedback channel, including screenshots returned as images so
-the model can see what it just built.
+The upstream tools cover sketches, driving dimensions, solid features,
+reference geometry, assemblies, mates, and drawings.
+Screenshots return the current view as an image so the model can inspect it.
 
 A sibling server, [`autocad-mcp`](https://github.com/limuzi013/autocad-mcp),
 does the same for AutoCAD.
 
-<!-- mcp-name: io.github.limuzi013/solidworks-mcp -->
 
 ---
 
@@ -26,7 +32,7 @@ does the same for AutoCAD.
 ## Install
 
 ```powershell
-git clone https://github.com/limuzi013/solidworks-mcp.git
+git clone --branch codex-enhancements https://github.com/A6721jpn/solidworks-mcp.git
 cd solidworks-mcp
 py -3 -m venv .venv
 .venv\Scripts\python.exe -m pip install .
@@ -36,7 +42,7 @@ That puts a `solidworks-mcp` command in the environment, which is what the MCP
 host runs. `uv` works too, if you prefer it:
 
 ```powershell
-uv tool install --from git+https://github.com/limuzi013/solidworks-mcp solidworks-mcp
+uv tool install --from git+https://github.com/A6721jpn/solidworks-mcp.git@codex-enhancements solidworks-mcp
 ```
 
 ### Claude Code / Claude Desktop
@@ -75,7 +81,7 @@ args = ['C:\path\to\solidworks-mcp\server.py']
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SW_MCP_OUTPUT_ROOT` | `~/Documents/solidworks-mcp` | Every file the server writes stays under here. Paths outside it are refused. |
+| `SW_MCP_OUTPUT_ROOT` | `~/Documents/solidworks-mcp` | Standard save and export tools refuse paths outside this directory. Caller-supplied scripts are not restricted to it. |
 | `SW_MCP_TEMPLATE_DIR` | auto-discovered | Where to look for `.prtdot` / `.asmdot` / `.drwdot` templates if SOLIDWORKS has no default configured. |
 | `SW_MCP_DEMO_TOOLS` | unset | Set to `1` to register the basketball demo tools. Off by default: a `create_basketball` sitting next to `revolve` measurably degrades tool selection. |
 

@@ -1,3 +1,4 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 # Copyright 2026 JIALE LIU
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,6 +101,8 @@ def _strip_internal(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "description": "Only return planar faces whose normal points this way, e.g. [0,0,1] for up.",
         },
         "tolerance": {"type": "number", "default": 0.02, "description": "Direction tolerance for the normal filter."},
+        "limit": {"type": "integer", "default": 60, "description": "Page size; filter first, page second."},
+        "offset": {"type": "integer", "default": 0},
     },
 )
 def list_faces(args: dict[str, Any]) -> dict[str, Any]:
@@ -124,12 +127,25 @@ def list_faces(args: dict[str, Any]) -> dict[str, Any]:
             if f.get("normal") and abs(sum(a * b for a, b in zip(f["normal"], target)) - 1.0) <= tolerance
         ]
 
+    matched = len(faces)
+    faces, note = _page(faces, args)
     return result(
         True,
-        f"Read {len(faces)} of {total} faces.",
+        f"Read {len(faces)} of {matched} matching faces ({total} in model){note}.",
         faces=_strip_internal(faces),
         total_faces=total,
+        matched=matched,
     )
+
+
+def _page(entries: list[dict[str, Any]], args: dict[str, Any], default_limit: int = 60) -> tuple[list[dict[str, Any]], str]:
+    """Page a listing so a 170-face import does not cost 25 KB per look."""
+    offset = max(0, int(args.get("offset", 0) or 0))
+    limit = max(1, int(args.get("limit", default_limit) or default_limit))
+    page = entries[offset:offset + limit]
+    if len(page) < len(entries):
+        return page, f", showing {offset}..{offset + len(page) - 1}; use offset/limit or filters for the rest"
+    return page, ""
 
 
 @tool(
@@ -144,6 +160,8 @@ def list_faces(args: dict[str, Any]) -> dict[str, Any]:
         },
         "min_length_mm": {"type": "number"},
         "max_length_mm": {"type": "number"},
+        "limit": {"type": "integer", "default": 80, "description": "Page size; filter first, page second."},
+        "offset": {"type": "integer", "default": 0},
     },
 )
 def list_edges(args: dict[str, Any]) -> dict[str, Any]:
@@ -159,7 +177,15 @@ def list_edges(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("max_length_mm") is not None:
         edges = [e for e in edges if e.get("length_mm", 1e18) <= float(args["max_length_mm"])]
 
-    return result(True, f"Read {len(edges)} of {total} edges.", edges=_strip_internal(edges), total_edges=total)
+    matched = len(edges)
+    edges, note = _page(edges, args, 80)
+    return result(
+        True,
+        f"Read {len(edges)} of {matched} matching edges ({total} in model){note}.",
+        edges=_strip_internal(edges),
+        total_edges=total,
+        matched=matched,
+    )
 
 
 @tool(
@@ -424,7 +450,10 @@ def _capture_png(doc: Any, width: int) -> bytes:
             "description": "Orient the view before capturing; 'current' leaves it alone.",
         },
         "zoom_to_fit": {"type": "boolean", "default": True},
-        "width_px": {"type": "integer", "default": 1100, "minimum": 200, "maximum": 2000},
+        "width_px": {
+            "type": "integer", "default": 800, "minimum": 200, "maximum": 2000,
+            "description": "Image width; tokens scale with pixels, so stay small unless detail matters.",
+        },
     },
 )
 def capture_screenshot(args: dict[str, Any]) -> dict[str, Any]:
@@ -446,7 +475,7 @@ def capture_screenshot(args: dict[str, Any]) -> dict[str, Any]:
         pass
     time.sleep(0.35)
 
-    data = _capture_png(doc, int(args.get("width_px", 1100)))
+    data = _capture_png(doc, int(args.get("width_px", 800)))
     payload = result(True, f"Captured the {view} view.", view=view, bytes=len(data))
     payload["_image_png_base64"] = base64.b64encode(data).decode("ascii")
     return payload

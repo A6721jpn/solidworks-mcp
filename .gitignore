@@ -1,3 +1,4 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 __pycache__/
 *.py[cod]
 .venv/
@@ -10,3 +11,23 @@ HANDOFF.md
 STATUS.md
 build/
 dist/
+
+# Local runtime data and credentials are not part of this distribution.
+.env
+.env.*
+!.env.example
+*.log
+*.log.*
+outputs/
+scratch/
+tests/bench/results/
+*.sldprt
+*.SLDPRT
+*.sldasm
+*.SLDASM
+*.slddrw
+*.SLDDRW
+*.step
+*.stp
+*.pem
+*.key

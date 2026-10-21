@@ -1,3 +1,4 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
@@ -37,8 +38,9 @@ dependencies = [
 solidworks-mcp = "solidworks_mcp.server:run"
 
 [project.urls]
-Homepage = "https://github.com/limuzi013/solidworks-mcp"
-Issues = "https://github.com/limuzi013/solidworks-mcp/issues"
+Upstream = "https://github.com/Slacker-LLC/solidworks-mcp"
+Homepage = "https://github.com/A6721jpn/solidworks-mcp"
+Issues = "https://github.com/A6721jpn/solidworks-mcp/issues"
 
 [tool.setuptools]
 packages = ["solidworks_mcp"]

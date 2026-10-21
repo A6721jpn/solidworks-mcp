@@ -1,3 +1,4 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 # Copyright 2026 JIALE LIU
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -936,17 +937,20 @@ def list_dimensions(args: dict[str, Any]) -> dict[str, Any]:
         while display is not None:
             try:
                 dimension = flag_methods(display, 'GetDimension2').GetDimension2(0)
-                full_name = str(safe(dimension, "FullName", ""))
+                # "D1@BasePad@Part7.Part" -> "D1@BasePad": the form set_dimension and
+                # IModelDoc2.Parameter take, and a third of the characters.
+                full_name = "@".join(str(safe(dimension, "FullName", "")).split("@")[:2])
                 system_value = float(safe(dimension, "SystemValue", 0.0) or 0.0)
                 entry: dict[str, Any] = {
                     "owner": owner,
                     "full_name": full_name,
                     "name": str(safe(dimension, "Name", "")),
-                    "driven": bool(safe(dimension, "DrivenState", 1) == 2),
+                    # swDimensionDrivenState_e: 1 = driven (reference), 2 = driving.
+                    "driven": bool(safe(dimension, "DrivenState", 2) == 1),
                 }
-                # Dimension type 3 is angular in swDimensionType_e; everything
-                # else we surface here is a length.
-                if int(safe(dimension, "GetType", 0) or 0) == 3:
+                # IDimension.GetType is swDimensionParamType_e: 0 linear,
+                # 1 angular, 2 integer (verified against the installed tlb).
+                if int(safe(dimension, "GetType", 0) or 0) == 1:
                     entry["value_deg"] = round(to_deg(system_value), 6)
                 else:
                     entry["value_mm"] = round(to_mm(system_value), 6)

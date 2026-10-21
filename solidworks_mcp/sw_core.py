@@ -1,3 +1,4 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 # Copyright 2026 JIALE LIU
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +36,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import pythoncom
+import pywintypes
 import win32com.client
+import win32com.client.dynamic
 from mcp.types import Tool
 
 
@@ -425,6 +428,92 @@ def byref_long(initial: int = 0) -> Any:
     return win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, initial)
 
 
+# --------------------------------------------------------------------------
+# Persistent references (fork)
+#
+# list_* indices die on the first geometry change.  SOLIDWORKS persist
+# references survive rebuilds, but a face's is ~800 bytes, so the server keeps
+# them and hands the agent short handles: f12, e7, v3.  Handles are per
+# document and stable for the life of the server process.
+# --------------------------------------------------------------------------
+
+INCLUDE_REFS = os.environ.get("SW_MCP_REFS", "1") != "0"
+
+
+class _RefTable:
+    def __init__(self) -> None:
+        self.by_key: dict[bytes, str] = {}
+        self.by_ref: dict[str, bytes] = {}
+        self.counters: dict[str, int] = {}
+
+    def handle(self, prefix: str, persist: bytes) -> str:
+        ref = self.by_key.get(persist)
+        if ref is None:
+            n = self.counters.get(prefix, 0)
+            self.counters[prefix] = n + 1
+            ref = f"{prefix}{n}"
+            self.by_key[persist] = ref
+            self.by_ref[ref] = persist
+        return ref
+
+
+_REF_TABLES: dict[str, _RefTable] = {}
+
+
+def _doc_identity(doc: Any) -> str:
+    return str(safe(doc, "GetPathName", "") or safe(doc, "GetTitle", "") or id(doc))
+
+
+def _ref_context(doc: Any) -> tuple[Any, _RefTable] | None:
+    if not INCLUDE_REFS:
+        return None
+    try:
+        ext = flag_methods(doc.Extension, "GetPersistReference3", "GetObjectByPersistReference3")
+    except Exception:
+        return None
+    return ext, _REF_TABLES.setdefault(_doc_identity(doc), _RefTable())
+
+
+def _attach_ref(entry: dict[str, Any], context: tuple[Any, _RefTable] | None, obj: Any, prefix: str) -> None:
+    if context is None or obj is None:
+        return
+    ext, table = context
+    try:
+        persist = ext.GetPersistReference3(obj)
+        if persist is not None:
+            entry["ref"] = table.handle(prefix, bytes(persist))
+    except Exception:
+        pass
+
+
+def resolve_ref(doc: Any, ref: str) -> Any:
+    """Turn a handle back into the live COM object, or raise with a useful message."""
+    table = _REF_TABLES.get(_doc_identity(doc))
+    persist = table.by_ref.get(str(ref)) if table else None
+    if persist is None:
+        raise RuntimeError(
+            f"Unknown ref '{ref}' for this document. Refs come from list_faces / list_edges / "
+            "list_vertices in this server session."
+        )
+    ext = flag_methods(doc.Extension, "GetObjectByPersistReference3")
+    obj, code = None, None
+    for packed in (persist, win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, persist)):
+        status = byref_long(0)
+        try:
+            obj = ext.GetObjectByPersistReference3(packed, status)
+        except Exception:
+            obj = None
+        code = status.value
+        if obj is not None:
+            break
+    if obj is None:
+        raise RuntimeError(
+            f"Ref '{ref}' no longer resolves (status {code}); the entity was probably consumed by a "
+            "later feature. Re-list to get current refs."
+        )
+    return obj
+
+
 def as_list(com_array: Any) -> list[Any]:
     """Normalise the several shapes SOLIDWORKS uses for 'array or nothing'."""
     if com_array is None:
@@ -440,10 +529,22 @@ def as_list(com_array: Any) -> list[Any]:
 
 
 def running_app() -> Any:
-    """Attach only to an already-running SOLIDWORKS session; never start one."""
+    """Attach only to an already-running SOLIDWORKS session; never start one.
+
+    Always late-bound.  ``win32com.client.GetActiveObject`` hands back an
+    early-bound gen_py wrapper whenever a makepy cache for sldworks.tlb exists
+    on the machine (one did here, generated on 2026-09-11), and that wrapper
+    has no ``_FlagAsMethod`` and rejects the VARIANT byref arguments this code
+    passes to OpenDoc6 and friends -- which is how open_document came to fail
+    with "int() argument must be ... not 'VARIANT'".  Wrapping the IDispatch
+    pointer with dynamic.Dispatch sidesteps the cache; child objects of a
+    dynamic wrapper are dynamic too.
+    """
     pythoncom.CoInitialize()
     try:
-        app = win32com.client.GetActiveObject("SldWorks.Application")
+        clsid = pywintypes.IID("SldWorks.Application")
+        dispatch = pythoncom.GetActiveObject(clsid).QueryInterface(pythoncom.IID_IDispatch)
+        app = win32com.client.dynamic.Dispatch(dispatch)
     except Exception as exc:
         raise RuntimeError(
             "No running SOLIDWORKS session is available. Open SOLIDWORKS and finish any modal dialogs first."
@@ -923,9 +1024,11 @@ def rotate_vector(vector: Sequence[float], matrix: Sequence[float] | None) -> li
 def enumerate_faces(doc: Any) -> list[dict[str, Any]]:
     faces: list[dict[str, Any]] = []
     index = 0
+    refs = _ref_context(doc)
     for body_index, (body, body_name, matrix) in enumerate(iter_body_context(doc)):
         for face in as_list(safe(body, "GetFaces")):
             entry: dict[str, Any] = {"index": index, "body_index": body_index, "body": body_name, "_obj": face}
+            _attach_ref(entry, refs, face, "f")
             point = _point_on(face, safe(face, "GetBox"), matrix)
             if point is not None:
                 entry["point_mm"] = mm_point(point)
@@ -988,9 +1091,11 @@ def _edge_endpoints(edge: Any, matrix: Sequence[float] | None = None) -> dict[st
 def enumerate_edges(doc: Any) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     index = 0
+    refs = _ref_context(doc)
     for body_index, (body, body_name, matrix) in enumerate(iter_body_context(doc)):
         for edge in as_list(safe(body, "GetEdges")):
             entry: dict[str, Any] = {"index": index, "body_index": body_index, "body": body_name, "_obj": edge}
+            _attach_ref(entry, refs, edge, "e")
             point = _edge_point(edge, matrix)
             if point is not None:
                 entry["point_mm"] = mm_point(point)
@@ -1014,6 +1119,7 @@ def enumerate_edges(doc: Any) -> list[dict[str, Any]]:
 def enumerate_vertices(doc: Any) -> list[dict[str, Any]]:
     vertices: list[dict[str, Any]] = []
     index = 0
+    refs = _ref_context(doc)
     for body_index, (body, _, matrix) in enumerate(iter_body_context(doc)):
         seen: set[tuple[float, float, float]] = set()
         for edge in as_list(safe(body, "GetEdges")):
@@ -1030,15 +1136,15 @@ def enumerate_vertices(doc: Any) -> list[dict[str, Any]]:
                 if key in seen:
                     continue
                 seen.add(key)
-                vertices.append(
-                    {
-                        "index": index,
-                        "body_index": body_index,
-                        "point_mm": mm_point(point),
-                        "_point_m": point,
-                        "_obj": vertex_obj,
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "index": index,
+                    "body_index": body_index,
+                    "point_mm": mm_point(point),
+                    "_point_m": point,
+                    "_obj": vertex_obj,
+                }
+                _attach_ref(entry, refs, vertex_obj, "v")
+                vertices.append(entry)
                 index += 1
     return vertices
 
@@ -1130,11 +1236,15 @@ def sketch_point_objects(doc: Any, sketch_name: str | None = None) -> list[Any]:
 SELECTION_SCHEMA = {
     "type": "object",
     "description": (
-        "What to operate on. Indices come from list_faces / list_edges / list_vertices / "
-        "list_sketch_segments and are only valid for the current model state, so re-list "
-        "after every geometry change."
+        "What to operate on. Prefer refs (f12, e7, v3 from list_faces / list_edges / list_vertices): "
+        "they survive geometry changes. Indices are only valid for the current model state."
     ),
     "properties": {
+        "refs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Persistent handles from list_faces/list_edges/list_vertices, e.g. ['f12','e7']. Survive rebuilds.",
+        },
         "faces": {"type": "array", "items": {"type": "integer"}, "description": "Face indices from list_faces."},
         "edges": {"type": "array", "items": {"type": "integer"}, "description": "Edge indices from list_edges."},
         "vertices": {"type": "array", "items": {"type": "integer"}, "description": "Vertex indices from list_vertices."},
@@ -1271,6 +1381,12 @@ def apply_selection(doc: Any, spec: dict[str, Any] | None, mark: int = 0, append
     ext = extension(doc) if any(
         spec.get(key) for key in ("features", "planes", "axes", "sketches", "components")
     ) else None
+
+    for ref in spec.get("refs", []) or []:
+        target = resolve_ref(doc, str(ref))
+        if not select_object(doc, target, mark, True):
+            raise RuntimeError(f"SOLIDWORKS refused to select ref '{ref}'.")
+        count += 1
 
     if spec.get("faces"):
         count += _select_indexed_objects(

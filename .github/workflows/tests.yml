@@ -1,8 +1,9 @@
+# Modified in the A6721jpn fork. See FORK.md for the changes.
 name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex-enhancements]
   pull_request:
   workflow_dispatch:
 
