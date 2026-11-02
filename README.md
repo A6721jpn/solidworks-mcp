@@ -166,6 +166,31 @@ Parametrics: `add_relation`, `add_dimension`, `set_dimension`, `list_dimensions`
 `rib`, `simple_hole`, `sweep`, `loft`, `linear_pattern`, `circular_pattern`,
 `mirror_feature`, `delete_feature`, `rename_feature`, `set_feature_suppression`.
 
+### Native sheet-metal bends
+
+`create_sketched_bend` creates a native sketched bend from an existing planar
+line sketch and a point on the stationary planar face. The part must contain
+exactly one native sheet-metal solid. Close sketch editing before calling it.
+
+Specify `expected_document_path`, `sketch_name`, `feature_name`,
+`stationary_point_mm`, `angle_deg`, and `inner_radius_mm`. The sketch must have
+one ordinary straight line. Optional `reverse_direction` and `k_factor` default
+to `true` and `0.5`. The tool uses a centerline bend and custom allowance.
+It checks the created feature's actual settings and native error code.
+It does not save or promise rollback after a partial failure.
+
+`get_sketched_bend` reads an existing native bend by `expected_document_path`
+and `feature_name`. It returns the actual radius, angle, direction, allowance
+flags, custom K factor, configuration, and native status without rebuilding,
+saving, changing selection, or changing rollback position. Effective default
+allowances and stationary references are explicitly unavailable rather than
+reported as assumed values. Reading stationary references through native
+selection access marks a clean document dirty, so the reader avoids that call.
+
+Use `list_dimensions` and `set_dimension` to edit the bend's numeric angle and
+radius. Both new commands use the existing MCP dispatcher and local CLI.
+Reconnect the MCP host after updating to refresh its advertised tool list.
+
 ### Inspection — the feedback channel
 | Tool | Purpose |
 | --- | --- |
