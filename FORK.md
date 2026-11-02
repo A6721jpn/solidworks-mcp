@@ -44,6 +44,59 @@ an optional live regression script, and a benchmark script.
 The upstream package publishing workflow and registry manifest are removed.
 The upstream offline test workflow is retained.
 
+## Scoped sketch edits
+
+Use `inspect_sketch` to read a named sketch's dimensions, geometric relations,
+and dependent equations. It resolves the feature directly and leaves the active
+sketch and configuration unchanged. Use `relation_types` and the `include_*`
+options to bound the information requested. Relations with external or ambiguous
+entity identities remain visible but have no deletion reference.
+
+| Tool | Behavior |
+| --- | --- |
+| `delete_sketch_relations` | Remove inspected relation signatures from the already-open named sketch. Stale or ambiguous signatures are refused. |
+| `rename_dimension` | Rename an existing dimension after checking for a name collision. |
+| `set_dimensions` | Validate all typed updates before writing; update active or all configurations; rebuild once outside an open sketch. |
+| `set_equation` | Add or compare-and-set one quoted equation target. Updating requires the exact prior equation text. Multi-configuration documents require explicit `all` scope. |
+| `copy_part_document` | Copy current part geometry to a new output file, retain the source path and unsaved changes, and restore an open sketch if SaveAs exits it. |
+
+Each tool requires `expected_document_path`. Standard length inputs use mm and
+angle inputs use degrees; fields named `system_value` or `system_values` are
+native metres/radians, with the dimension kind reported alongside them.
+The new tools never save the source. Legitimate mutations can make a clean
+document dirty. Bulk operations stop at a native failure and report partial
+changes; they do not promise rollback. Local `diff_scope` explicitly says that
+downstream geometry has not been checked. Use native model verification after
+editing a meaningful unit of work.
+
+`set_dimensions` verifies values in the active configuration. An `all` write
+uses the native all-configuration setter and explicitly lists inactive
+configurations as unverified. SOLIDWORKS can return zero for inactive sketch
+dimensions even when the stored value is correct. The tool leaves the sketch
+and configuration untouched; use `set_configuration` and model verification
+when other configurations also need to be checked.
+
+These tools return scoped native readback rather than collecting the whole
+model twice. Unrestricted `run_script` keeps its full automatic model snapshots;
+its existing `call()` function can compose the new primitives. Every dispatched
+response carries `timing_ms` for guards, snapshots, handler, mutex acquisition
+and total. Handler time includes its native writes, rebuild and readback.
+
+For a same-work comparison on a copied part, run
+`tests/bench/sketch_inspection.py` with `--document`, `--sketch`, and `--output`.
+The benchmark alternates the existing script wrapper and the scoped tool and
+checks that they return the same data. It reports in-process dispatcher time,
+not whole-task or network latency.
+
+A five-pair comparison on one copied 37-segment sketch in SOLIDWORKS 2026
+SP3.2 returned equal filtered relations, dimensions and equation data. Median
+dispatcher time was 27.29 s through the script wrapper and 6.68 s through the
+scoped tool. Ranges were 24.83–60.16 s and 6.01–7.82 s respectively, with zero
+errors in the completed comparison. A separate phase profile attributed
+34.44 s of one 35.24 s short script call to its two whole-model snapshots.
+These figures describe this inspection case, not the duration of an entire
+CAD editing task.
+
 ## Configuration
 
 | Variable | Default | Meaning |

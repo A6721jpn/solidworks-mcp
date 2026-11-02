@@ -162,11 +162,13 @@ class ScopedSketchTests(unittest.TestCase):
         self.assertEqual([d.values[1] for d in self.dimensions], [.02, .02])
         self.assertEqual(len(self.rebuilt), 1)
 
-    def test_all_configuration_scope_is_verified_without_switching(self):
+    def test_all_configuration_write_reports_active_only_verification(self):
         out = ops.set_dimensions(self.updates(configuration_scope="all"))
         self.assertTrue(out["ok"], out)
         self.assertEqual(self.dimensions[1].values, [.03, .03])
-        self.assertEqual(out["data"]["items"][1]["after"]["configurations"], ["Default", "Other"])
+        after = out["data"]["items"][1]["after"]
+        self.assertEqual(after["verified_configurations"], ["Default"])
+        self.assertEqual(after["unverified_configurations"], ["Other"])
 
     def test_native_failure_stops_and_reports_applied_items(self):
         self.dimensions[1].status = 1
@@ -179,6 +181,37 @@ class ScopedSketchTests(unittest.TestCase):
         self.assertEqual(out["data"]["applied"], ["D1@Sketch1"])
         self.assertEqual(self.dimensions[2].writes, [])
         self.assertEqual(len(self.rebuilt), 1)
+
+    def test_partial_failure_rereads_values_after_rebuild(self):
+        self.dimensions[1].status = 1
+        def rebuild(doc):
+            self.dimensions[0].values[0] = .012
+            return True
+        with patch.object(ops, "rebuild", side_effect=rebuild):
+            out = ops.set_dimensions(self.updates())
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["data"]["partial"])
+        self.assertEqual(out["data"]["items"][0]["after"]["system_values"], [.012])
+        self.assertNotIn("D1@Sketch1", out["data"]["applied"])
+
+    def test_incomplete_dimension_enumeration_is_not_success(self):
+        self.feature.GetFirstDisplayDimension = lambda: SimpleNamespace(GetDimension2=lambda i:self.dimensions[0])
+        self.feature.GetNextDisplayDimension = lambda display: (_ for _ in ()).throw(RuntimeError("COM read failed"))
+        out = ops.inspect_sketch({"expected_document_path":"C:/part.SLDPRT", "sketch_name":"Sketch1",
+                                  "include_relations":False, "include_equations":False})
+        self.assertFalse(out["ok"])
+        self.assertIn("COM read failed",out["message"])
+
+    def test_final_verification_reads_all_attempted_items(self):
+        def rebuild(doc):
+            self.dimensions[0].values[0] = .012
+            self.dimensions[1].values[0] = .013
+            return True
+        with patch.object(ops, "rebuild", side_effect=rebuild):
+            out = ops.set_dimensions(self.updates())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["data"]["applied"], [])
+        self.assertEqual([i["after"]["system_values"] for i in out["data"]["items"]], [[.012],[.013]])
 
     def test_open_sketch_is_preserved_and_never_rebuilt(self):
         self.doc.SketchManager.ActiveSketch = self.sketch

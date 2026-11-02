@@ -12,7 +12,6 @@ import pythoncom
 from .sw_core import (as_list, document_path_key, empty_variant, flag_methods, rebuild,
                       require_document_path, result, safe, tool, value)
 from .sw_sketch import RELATION_NAMES, RELATIONS
-from .sw_snapshot import feature_dimensions
 
 _NAME = {"type": "string", "minLength": 1}
 _BASE = {"expected_document_path": _NAME}
@@ -92,7 +91,7 @@ def _relations(app: Any, doc: Any, sketch: Any, name: str,
                 raise ValueError("Relation has no definition entities.")
             row["entities"] = sorted(identities, key=lambda e: json.dumps(e, sort_keys=True))
             signature = {**context, "type": kind, "entities": row["entities"], "entities_source": source}
-            row["relation_ref"] = "rel:" + hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+            row["relation_ref"] = f"rel:{kind}:" + hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
         except Exception as exc:
             row.update(relation_ref=None, unsupported_identity=str(exc))
         rows.append((row, relation))
@@ -145,6 +144,26 @@ def _dimension(doc: Any, name: str) -> tuple[Any, dict[str, Any]]:
                  "kind": {0: "linear", 1: "angular"}.get(kind, "unsupported"),
                  "driven": driven == 1, "driven_state": driven,
                  "system_value": float(value(dim, "SystemValue"))}
+
+
+def _dimensions(doc: Any, feature: Any) -> list[dict[str, Any]]:
+    rows = []
+    seen = set()
+    display = value(feature, "GetFirstDisplayDimension")
+    while display is not None:
+        dim = flag_methods(display, "GetDimension2").GetDimension2(0)
+        name = "@".join(str(value(dim, "FullName")).split("@")[:2])
+        if name in seen:
+            raise RuntimeError("Repeated dimension during scoped inspection; enumeration is incomplete.")
+        seen.add(name)
+        _, row = _dimension(doc, name)
+        if row["kind"] == "angular":
+            row["display_value"] = f'{math.degrees(row["system_value"]):.3f}deg'
+        else:
+            row["display_value"] = row["system_value"] * 1000
+        rows.append(row)
+        display = flag_methods(feature, "GetNextDisplayDimension").GetNextDisplayDimension(display)
+    return rows
 
 
 def _finish(doc: Any, items: list[dict[str, Any]], error: str = "", *, attempted: bool = False,
@@ -202,8 +221,7 @@ def inspect_sketch(args: dict[str, Any]) -> dict[str, Any]:
             selected = None if kinds is None else {RELATIONS[k] if isinstance(k, str) else int(k) for k in kinds}
             data["relations"] = [row for row, _ in _relations(app, doc, sketch, name, selected)]
         if args.get("include_dimensions", True):
-            data["dimensions"] = [dict(_dimension(doc, n)[1], display_value=v)
-                                  for n, v in feature_dimensions(feature).items()]
+            data["dimensions"] = _dimensions(doc, feature)
         if args.get("include_equations", True):
             _, equations = _equations(doc)
             dependencies = {row["full_name"] for row in data.get("dimensions", [])}
@@ -238,24 +256,28 @@ def delete_sketch_relations(args: dict[str, Any]) -> dict[str, Any]:
         refs = args.get("relation_refs")
         if not isinstance(refs, list) or not refs or any(not isinstance(r, str) for r in refs) or len(set(refs)) != len(refs):
             raise ValueError("relation_refs must be a nonempty array of distinct inspected references.")
+        matches = [re.fullmatch(r"rel:(\d+):[a-f0-9]{64}", ref) for ref in refs]
+        if not all(matches):
+            raise ValueError("Unsupported or stale relation reference. Inspect again.")
+        kinds = {int(match[1]) for match in matches}
         app, doc = _doc(args)
         name, feature, sketch = _sketch(doc, args.get("sketch_name"))
         active = doc.SketchManager.ActiveSketch
         if active is None or int(flag_methods(app, "IsSame").IsSame(active, sketch)) != 1:
             raise ValueError("The named sketch must already be open for editing.")
-        before = {r["relation_ref"]: r for r, _ in _relations(app, doc, sketch, name) if r["relation_ref"]}
+        before = {r["relation_ref"]: r for r, _ in _relations(app, doc, sketch, name, kinds) if r["relation_ref"]}
         if any(ref not in before for ref in refs):
             raise ValueError("Missing, stale, ambiguous, or unsupported relation reference. Inspect again.")
         manager = flag_methods(value(sketch, "RelationManager"), "DeleteRelation")
         for ref in refs:
-            current = {r["relation_ref"]: (r, native) for r, native in _relations(app, doc, sketch, name) if r["relation_ref"]}
+            current = {r["relation_ref"]: (r, native) for r, native in _relations(app, doc, sketch, name, kinds) if r["relation_ref"]}
             if ref not in current or current[ref][0] != before[ref]:
                 raise RuntimeError("Relation signature changed before deletion. Inspect again.")
             item = {"target": ref, "before": before[ref], "applied": False, "may_have_changes": True}
             items.append(item)
             attempted = True
             item["native_status"] = bool(manager.DeleteRelation(current[ref][1]))
-            remaining = {r["relation_ref"] for r, _ in _relations(app, doc, sketch, name)}
+            remaining = {r["relation_ref"] for r, _ in _relations(app, doc, sketch, name, kinds)}
             item.update(after=None if ref not in remaining else before[ref], applied=ref not in remaining)
             if not item["native_status"] or not item["applied"]:
                 raise RuntimeError("Native relation deletion failed; remaining deletions were skipped.")
@@ -294,7 +316,8 @@ def rename_dimension(args: dict[str, Any]) -> dict[str, Any]:
         return _finish(doc, items, str(exc), attempted=attempted) if attempted else _reject(exc)
 
 
-@tool("set_dimensions", "Prevalidate typed dimension changes, apply native scoped values, rebuild once outside sketches.",
+@tool("set_dimensions", "Prevalidate typed dimension changes, apply native scoped values, rebuild once outside sketches. "
+      "Verify active values and explicitly list inactive configurations as unverified.",
       {**_BASE, "configuration_scope": _SCOPE,
        "updates": {"type": "array", "minItems": 1, "items": {"type": "object", "properties":
            {"full_name": _NAME, "value_mm": {"type": "number"}, "value_deg": {"type": "number"}}, "required": ["full_name"]}}},
@@ -322,9 +345,11 @@ def set_dimensions(args: dict[str, Any]) -> dict[str, Any]:
         _, doc = _doc(args)
         _, equations = _equations(doc)
         controlled = {"@".join(_lhs(row["equation"]).split("@")[:2]) for row in equations}
-        configurations = as_list(value(doc, "GetConfigurationNames")) if scope == "all" else [_configuration(doc)]
-        if not configurations:
+        requested_configurations = as_list(value(doc, "GetConfigurationNames")) if scope == "all" else [_configuration(doc)]
+        if not requested_configurations:
             raise ValueError("Could not read dimension configuration scope.")
+        configurations = [_configuration(doc)]
+        pending = [name for name in requested_configurations if name not in configurations]
         prepared = []
         for name, unit, target in requests:
             dim, before = _dimension(doc, name)
@@ -333,37 +358,48 @@ def set_dimensions(args: dict[str, Any]) -> dict[str, Any]:
             if before["kind"] != {"value_mm": "linear", "value_deg": "angular"}[unit]:
                 raise ValueError(f"Unit does not match native dimension kind for {name}.")
             flag_methods(dim, "SetSystemValue3", "GetSystemValue3")
-            before["system_values"] = _dimension_values(dim, scope, len(configurations))
+            before["system_values"] = _active_dimension_values(dim)
             before["configurations"] = configurations
+            before["requested_configurations"] = requested_configurations
             prepared.append((dim, name, before, target))
         def verify() -> None:
+            failures = []
             for (_, name, _, target), item in zip(prepared, items):
-                dim, _ = _dimension(doc, name)
-                flag_methods(dim, "GetSystemValue3")
-                actual = _dimension_values(dim, scope, len(configurations))
-                item.update(after={"system_values": actual, "configurations": configurations},
-                            applied=all(abs(v-target) <= 1e-9 for v in actual))
-                if not item["applied"]:
-                    raise RuntimeError(f"Dimension value failed final verification for {name}.")
+                try:
+                    dim, _ = _dimension(doc, name)
+                    flag_methods(dim, "GetSystemValue3")
+                    actual = _active_dimension_values(dim)
+                    item.update(after={"system_values": actual, "verified_configurations": configurations,
+                                       "unverified_configurations": pending},
+                                applied=all(abs(v-target) <= 1e-9 for v in actual))
+                    if not item["applied"]:
+                        failures.append(name)
+                except Exception as exc:
+                    item.update(applied=False, readback_error=str(exc))
+                    failures.append(name)
+            if failures:
+                raise RuntimeError("Dimension value failed final verification: " + ", ".join(failures))
         for dim, name, before, target in prepared:
             item = {"target": name, "before": before, "applied": False, "may_have_changes": True}
             items.append(item)
             attempted = True
             item["native_status"] = int(dim.SetSystemValue3(target, 1 if scope == "active" else 2, empty_variant()))
-            actual = _dimension_values(dim, scope, len(configurations))
-            item.update(after={"system_values": actual, "configurations": configurations},
+            actual = _active_dimension_values(dim)
+            item.update(after={"system_values": actual, "verified_configurations": configurations,
+                               "unverified_configurations": pending},
                         applied=all(abs(v-target) <= 1e-9 for v in actual))
             if item["native_status"] != 0 or not item["applied"]:
                 raise RuntimeError(f"Native value change failed for {name}; remaining changes were skipped.")
         return _finish(doc, items, attempted=attempted, scope=scope, verify=verify)
     except Exception as exc:
-        return _finish(doc, items, str(exc), attempted=attempted, scope=scope) if attempted else _reject(exc)
+        return _finish(doc, items, str(exc), attempted=attempted, scope=scope, verify=verify) if attempted else _reject(exc)
 
 
-def _dimension_values(dim: Any, scope: str, count: int) -> list[float]:
-    numbers = [float(v) for v in as_list(dim.GetSystemValue3(1 if scope == "active" else 2, empty_variant()))]
-    if len(numbers) != count or not all(math.isfinite(v) for v in numbers):
-        raise RuntimeError("Native dimension values did not cover the requested configuration scope.")
+def _active_dimension_values(dim: Any) -> list[float]:
+    # Inactive sketch dimensions can return zero from the native all-configurations getter.
+    numbers = [float(v) for v in as_list(dim.GetSystemValue3(1, empty_variant()))]
+    if len(numbers) != 1 or not all(math.isfinite(v) for v in numbers):
+        raise RuntimeError("Native active-configuration dimension readback is unavailable.")
     return numbers
 
 

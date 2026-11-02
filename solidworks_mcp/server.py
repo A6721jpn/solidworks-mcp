@@ -105,6 +105,7 @@ AUTO_DIFF = os.environ.get("SW_MCP_AUTO_DIFF", "1") != "0"
 _RECIPES = sw_script._preload_recipe_index()
 INSTRUCTIONS = (
     "SOLIDWORKS COM bridge; lengths in mm, angles in deg. Workflow: model_snapshot to read state; "
+    "for a known sketch prefer inspect_sketch and set_dimensions for scoped reads and one-rebuild updates; "
     "one tool per change, or run_script for 3+ steps/loops; read the 'diff' each mutating result "
     "carries instead of re-listing; verify by numbers (check_errors, measure, model_diff) and use "
     "capture_screenshot only when the shape itself must be seen. selection.refs (from list_faces / "
