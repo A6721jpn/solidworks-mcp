@@ -40,6 +40,160 @@ def _number(raw: Any, label: str, positive: bool = False) -> float:
     return number
 
 
+@tool(
+    "create_sketched_bend",
+    "Create one native sheet-metal sketched bend from an existing planar line sketch and an interior "
+    "point on its stationary planar sheet-metal face. Uses a centerline bend and a custom "
+    "K factor. The existing sheet-metal body must already exist. No save or rollback.",
+    {"expected_document_path": PATH, "sketch_name": NAME, "feature_name": NAME,
+     "stationary_point_mm": VECTOR, "angle_deg": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 180},
+     "inner_radius_mm": {"type": "number", "exclusiveMinimum": 0},
+     "reverse_direction": {"type": "boolean", "default": True},
+     "k_factor": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5}},
+    ["expected_document_path", "sketch_name", "feature_name", "stationary_point_mm", "angle_deg", "inner_radius_mm"],
+)
+def create_sketched_bend(args: dict[str, Any]) -> dict[str, Any]:
+    feature = None
+    doc = None
+    readback = None
+    try:
+        name = _name(args.get("feature_name"), "feature_name")
+        sketch_name = _name(args.get("sketch_name"), "sketch_name")
+        point = _vector(args.get("stationary_point_mm"), "stationary_point_mm")
+        angle = _number(args.get("angle_deg"), "angle_deg", True)
+        radius = _number(args.get("inner_radius_mm"), "inner_radius_mm", True)
+        k = _number(args.get("k_factor", 0.5), "k_factor")
+        reverse = args.get("reverse_direction", True)
+        if angle >= 180 or not 0 <= k <= 1 or not isinstance(reverse, bool):
+            raise ValueError("Require angle_deg < 180, k_factor in [0,1], and a boolean reverse_direction.")
+        _, doc = require_document_path(args["expected_document_path"], 1)
+        if value(value(doc, "SketchManager"), "ActiveSketch") is not None:
+            raise ValueError("Close the active sketch before creating a bend.")
+        _unused_feature_name(doc, name)
+        sketches = [f for f in _features(doc) if str(value(f, "Name")) == sketch_name]
+        if len(sketches) != 1 or str(value(sketches[0], "GetTypeName2")) != "ProfileFeature":
+            raise ValueError("sketch_name must identify one existing planar sketch.")
+        segments = [s for s in as_list(value(value(sketches[0], "GetSpecificFeature2"), "GetSketchSegments"))
+                    if not value(s, "ConstructionGeometry")]
+        if len(segments) != 1 or int(value(segments[0], "GetType")) != 0:
+            raise ValueError("The bend sketch must contain exactly one ordinary straight line.")
+        solids = as_list(flag_methods(doc, "GetBodies2").GetBodies2(0, False))
+        if len(solids) != 1 or not value(solids[0], "IsSheetMetal"):
+            raise ValueError("Require exactly one native sheet-metal solid.")
+        flag_methods(doc, "ClearSelection2").ClearSelection2(True)
+        if not flag_methods(sketches[0], "Select2").Select2(False, 0):
+            raise RuntimeError("Could not select the bend sketch.")
+        p = [x / 1000 for x in point]
+        if not extension(doc).SelectByID2("", "FACE", *p, True, 0, nothing(), 0):
+            raise ValueError("No stationary face at stationary_point_mm.")
+        face = value(doc, "SelectionManager").GetSelectedObject6(2, -1)
+        if int(value(value(face, "GetSurface"), "Identity")) != 4001 or not value(value(face, "GetBody"), "IsSheetMetal"):
+            raise ValueError("The stationary point must select a planar sheet-metal face.")
+        closest = flag_methods(face, "GetClosestPointOn").GetClosestPointOn(*p)
+        if closest is None or math.dist(p, closest[:3]) > 1e-8:
+            raise ValueError("stationary_point_mm must lie on the stationary face.")
+        manager = flag_methods(value(doc, "FeatureManager"), "CreateDefinition", "CreateCustomBendAllowance", "CreateFeature")
+        data = manager.CreateDefinition(35)
+        data.BendAngle = math.radians(angle)
+        data.BendRadius = radius / 1000
+        data.PositionType = 4
+        data.ReverseDirection = reverse
+        data.UseDefaultBendRadius = False
+        data.UseGaugeTable = False
+        allowance = manager.CreateCustomBendAllowance()
+        allowance.KFactor = k
+        flag_methods(data, "SetCustomBendAllowance").SetCustomBendAllowance(allowance)
+        feature = manager.CreateFeature(data)
+        if feature is None:
+            raise RuntimeError("SOLIDWORKS did not create the sketched bend.")
+        _rename(feature, name)
+        flag_methods(doc, "ForceRebuild3").ForceRebuild3(False)
+        flag_methods(doc, "ClearSelection2").ClearSelection2(True)
+        readback = _read_sketched_bend(doc, feature)
+        if readback["native_error"] or readback["rolled_back"]:
+            raise RuntimeError(f"The new bend has native error {readback['native_error']} or remains rolled back.")
+        expected = {"angle_deg": angle, "inner_radius_mm": radius, "k_factor": k,
+                    "reverse_direction": reverse, "position_type": 4,
+                    "use_default_bend_radius": False, "use_default_bend_allowance": False,
+                    "use_gauge_table": False}
+        mismatches = []
+        for key, requested in expected.items():
+            actual = readback[key]
+            matches = (actual == requested if isinstance(requested, bool) else
+                       actual is not None and math.isclose(actual, requested, rel_tol=1e-7, abs_tol=1e-7))
+            if not matches:
+                mismatches.append(key)
+        if mismatches:
+            raise RuntimeError("Created bend native readback differs from the request: " + ", ".join(mismatches) + ".")
+        return result(True, "Created native sketched bend.", **readback,
+                      diff={"added_feature": name, "type": "SM3dBend", "sketch": sketch_name})
+    except Exception as exc:
+        failure = _failure(exc, feature)
+        if readback is not None:
+            failure["data"]["native_readback"] = readback
+        return failure
+    finally:
+        if doc is not None:
+            flag_methods(doc, "ClearSelection2").ClearSelection2(True)
+
+
+def _read_sketched_bend(doc: Any, feature: Any) -> dict[str, Any]:
+    if str(value(feature, "GetTypeName2")) != "SM3dBend":
+        raise ValueError("feature_name must identify a native SM3dBend feature.")
+    data = value(feature, "GetDefinition")
+    if data is None:
+        raise RuntimeError("The native sketched-bend definition is unavailable.")
+    use_default_allowance = bool(value(data, "UseDefaultBendAllowance"))
+    allowance = value(data, "GetCustomBendAllowance")
+    if allowance is None and not use_default_allowance:
+        raise RuntimeError("The native custom bend allowance is unavailable.")
+    allowance_type = int(value(allowance, "Type")) if allowance is not None else None
+    custom_k = _number(value(allowance, "KFactor"), "native KFactor") if allowance_type == 2 else None
+    return {
+        "feature": str(value(feature, "Name")), "type": "SM3dBend",
+        "configuration": _configurations(doc)[1],
+        "angle_deg": math.degrees(_number(value(data, "BendAngle"), "native BendAngle")),
+        "inner_radius_mm": _number(value(data, "BendRadius"), "native BendRadius") * 1000,
+        "reverse_direction": bool(value(data, "ReverseDirection")),
+        "position_type": int(value(data, "PositionType")),
+        "use_default_bend_radius": bool(value(data, "UseDefaultBendRadius")),
+        "use_default_bend_allowance": use_default_allowance,
+        "use_gauge_table": bool(value(data, "UseGaugeTable")),
+        "custom_bend_allowance": {"type": allowance_type, "k_factor": custom_k},
+        "k_factor": custom_k if not use_default_allowance else None,
+        "k_factor_source": "default_unavailable" if use_default_allowance else "custom",
+        "native_error": int(value(feature, "GetErrorCode")),
+        "rolled_back": bool(value(feature, "IsRolledBack")),
+        "stationary_reference": {
+            "available": False,
+            "face_ref": None, "point_bend_sketch_mm": None,
+            "reason": "Requires native selection access, which marks the document dirty.",
+        },
+    }
+
+
+@tool(
+    "get_sketched_bend",
+    "Read the actual native SM3dBend definition in the active configuration. No save, rebuild, "
+    "configuration switch, or selection clearing. Custom allowance values are distinguished "
+    "from effective defaults; unavailable stationary references are explicit.",
+    {"expected_document_path": PATH, "feature_name": NAME},
+    ["expected_document_path", "feature_name"],
+)
+def get_sketched_bend(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        name = _name(args.get("feature_name"), "feature_name")
+        _, doc = require_document_path(args["expected_document_path"], 1)
+        if value(value(doc, "SketchManager"), "ActiveSketch") is not None:
+            raise ValueError("Close the active sketch before inspecting a bend.")
+        matches = [feature for feature in _features(doc) if str(value(feature, "Name")) == name]
+        if len(matches) != 1:
+            raise ValueError(f"Feature '{name}' must resolve uniquely; found {len(matches)}.")
+        return result(True, "Read native sketched bend.", **_read_sketched_bend(doc, matches[0]))
+    except Exception as exc:
+        return _failure(exc)
+
+
 def _vector(raw: Any, label: str) -> list[float]:
     if not isinstance(raw, (tuple, list)) or len(raw) != 3:
         raise ValueError(f"{label} must contain exactly three numbers.")

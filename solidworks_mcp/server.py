@@ -122,7 +122,7 @@ READ_ONLY_TOOLS = {
     "set_view", "capture_screenshot", "list_reference_planes", "list_sketches",
     "list_sketch_segments", "get_sketch_status", "list_dimensions", "set_appearance",
     "model_snapshot", "model_diff", "dismiss_dialog", "list_recipes", "get_recipe", "save_recipe",
-    "list_configurations", "list_drawing_entities", "inspect_drawing_assets",
+    "list_configurations", "get_sketched_bend", "list_drawing_entities", "inspect_drawing_assets",
     "inspect_solidworks_ui", "activate_solidworks_window", "cancel_solidworks_command",
 }
 
