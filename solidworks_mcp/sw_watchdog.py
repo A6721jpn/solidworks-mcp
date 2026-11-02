@@ -174,6 +174,14 @@ class DialogWatchdog:
             events, self.events = self.events, []
         return events
 
+    def event_cursor(self) -> int:
+        with self._lock:
+            return len(self.events)
+
+    def events_since(self, cursor: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.events[cursor:])
+
     def _loop(self) -> None:
         blocked_since: float | None = None
         handled: set[int] = set()

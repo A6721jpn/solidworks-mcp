@@ -53,6 +53,10 @@ from .sw_core import (
     tool,
     value,
     nothing,
+    double_array,
+    require_document_path,
+    open_document_by_path,
+    to_rad,
 )
 from .sw_file import new_document
 
@@ -221,6 +225,13 @@ def _view_entry(view: Any, index: int) -> dict[str, Any]:
     referenced = str(safe(view, "GetReferencedModelName", "") or "")
     if referenced:
         entry["model"] = referenced
+        entry["configuration"] = str(safe(view, "ReferencedConfiguration", ""))
+        angle = safe(view, "Angle")
+        if angle is not None:
+            entry["angle_deg"] = round(float(angle) * 180.0 / 3.141592653589793, 6)
+        outline = safe(view, "GetOutline")
+        if outline is not None:
+            entry["outline_mm"] = [round(to_mm(v), 4) for v in outline]
     return entry
 
 
@@ -425,11 +436,15 @@ def _model_view_name(app: Any, model: str, wanted: str) -> str:
 
 
 def _apply_view_options(view: Any, args: dict[str, Any]) -> None:
-    if args.get("scale"):
-        try:
-            view.ScaleDecimal = float(args["scale"])
-        except Exception:
-            logger.info("Could not override the view scale.")
+    if args.get("scale") is not None:
+        import math
+        scale = float(args["scale"])
+        if not math.isfinite(scale) or scale <= 0:
+            raise RuntimeError("View scale must be positive and finite.")
+        view.UseSheetScale = 0
+        view.ScaleDecimal = scale
+        if abs(float(value(view, "ScaleDecimal"))-scale) > 1e-9:
+            raise RuntimeError("View scale readback differs from requested scale.")
     mode = args.get("display_mode")
     if mode:
         try:
@@ -529,7 +544,7 @@ def _draw_in_view(doc: Any, parent_view: str | None, draw: Any) -> tuple[str, An
     if entity is None:
         raise RuntimeError("SOLIDWORKS did not draw the reference geometry in the view.")
     clear_selection(doc)
-    from sw_core import select_object
+    from .sw_core import select_object
 
     if not select_object(doc, entity, mark=0, append=False):
         raise RuntimeError("Could not select the reference geometry just drawn.")
@@ -557,7 +572,7 @@ def _draw_in_view(doc: Any, parent_view: str | None, draw: Any) -> tuple[str, An
     ["place_x_mm", "place_y_mm"],
 )
 def insert_section_view(args: dict[str, Any]) -> dict[str, Any]:
-    from sw_core import empty_variant
+    from .sw_core import empty_variant
 
     _, doc = require_drawing()
     parent = args.get("parent_view")
@@ -708,8 +723,11 @@ def create_drawing_sketch(args: dict[str, Any]) -> dict[str, Any]:
     "lower-left corner.",
     {
         "name": {"type": "string"},
+        "expected_document_path": {"type": "string", "description": "Optional exact document_key guard before modification."},
         "x_mm": {"type": "number"},
         "y_mm": {"type": "number"},
+        "configuration": {"type": "string", "description": "Explicit referenced model configuration; never changes assembly references."},
+        "angle_deg": {"type": "number", "description": "Absolute in-plane drawing-view rotation."},
         "scale": {"type": "number", "description": "Decimal scale, e.g. 0.25 for 1:4."},
         "display_mode": {"type": "string", "enum": sorted(DISPLAY_MODES)},
         "tangent_edges": {
@@ -721,16 +739,32 @@ def create_drawing_sketch(args: dict[str, Any]) -> dict[str, Any]:
     ["name"],
 )
 def set_drawing_view(args: dict[str, Any]) -> dict[str, Any]:
-    from sw_core import double_array
-
-    _, doc = require_drawing()
+    app, doc = require_drawing()
+    if args.get("expected_document_path"):
+        require_document_path(str(args["expected_document_path"]), 3)
     name = str(args["name"])
     target = next((v for v in _iter_views(doc) if str(safe(v, "GetName2", "")) == name), None)
     if target is None:
         return result(False, f"No view named '{name}'. Call list_drawing_views for the names.")
 
-    if args.get("x_mm") is not None and args.get("y_mm") is not None:
-        target.Position = double_array([to_m(args["x_mm"]), to_m(args["y_mm"])])
+    if args.get("configuration") is not None:
+        model = open_document_by_path(app, str(value(target, "GetReferencedModelName")))
+        cfg = str(args["configuration"])
+        if cfg not in [str(n) for n in as_list(value(model, "GetConfigurationNames"))]:
+            return result(False, f"Model has no configuration '{cfg}'.")
+        target.ReferencedConfiguration = cfg
+        if str(value(target, "ReferencedConfiguration")) != cfg:
+            return result(False, "View configuration did not persist.")
+    if args.get("x_mm") is not None or args.get("y_mm") is not None:
+        position = list(value(target, "Position"))
+        target.Position = double_array([to_m(args["x_mm"]) if args.get("x_mm") is not None else position[0],
+                                        to_m(args["y_mm"]) if args.get("y_mm") is not None else position[1]])
+    if args.get("angle_deg") is not None:
+        import math
+        angle = float(args["angle_deg"])
+        if not math.isfinite(angle):
+            raise RuntimeError("angle_deg must be finite.")
+        target.Angle = to_rad(angle)
     _apply_view_options(target, args)
     if args.get("tangent_edges"):
         mode = {"visible": 1, "hidden": 2, "phantom": 3}[str(args["tangent_edges"])]
@@ -904,7 +938,7 @@ def _select_circular_edges(doc: Any, view: Any) -> int:
     view, so a tool that means "mark every hole here" has to build that
     selection itself.
     """
-    from sw_core import nothing
+    from .sw_core import nothing
 
     clear_selection(doc)
     count = 0

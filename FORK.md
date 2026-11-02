@@ -20,6 +20,9 @@ GitHub currently identifies `Slacker-LLC/solidworks-mcp` as this fork's parent.
 - `selection.refs` identifies entities using persistent references.
 - Compact output and paginated geometry lists reduce response size.
 - A dialog watchdog reports dialogs encountered during tool execution.
+- Additional drawing, sheet, annotation, surface and deformation tools.
+- A local CLI shares the MCP dispatcher and serializes concurrent operations.
+- Project-local coverage audit tools support tracking CAD operation coverage.
 
 ## Modified upstream files
 
@@ -29,6 +32,7 @@ GitHub currently identifies `Slacker-LLC/solidworks-mcp` as this fork's parent.
 | `solidworks_mcp/sw_core.py` | Use late-bound COM dispatch, persistent references, and dimension fixes. |
 | `solidworks_mcp/sw_inspect.py` | Add geometry pagination and reference handles. |
 | `solidworks_mcp/sw_sketch.py` | Normalize dimension names and correct angular and driven-dimension reporting. |
+| `solidworks_mcp/sw_assembly.py`, `sw_drawing.py`, `sw_file.py`, `sw_refgeom.py` | Extend document and drawing operations and correct imports. |
 | `README.md` | Identify this fork and document installation and script permissions. |
 | `pyproject.toml` | Point project links at this fork and retain the upstream link. |
 | `.gitignore` | Exclude local data, CAD files, logs, and credentials. |

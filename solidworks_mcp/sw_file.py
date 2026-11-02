@@ -29,6 +29,7 @@ from .sw_core import (
     clear_selection,
     document_info,
     document_type,
+    document_path_key,
     double_array,
     EXPORT_EXTENSIONS,
     extension,
@@ -176,15 +177,18 @@ def open_document(args: dict[str, Any]) -> dict[str, Any]:
     # left the next tool operating on whichever drawing or part happened to be
     # active, despite this tool promising otherwise.
     activation_errors = byref_long(0)
-    activated = bool(app.ActivateDoc3(str(path), False, 0, activation_errors))
-    if not activated:
+    activated = app.ActivateDoc3(str(value(doc, "GetTitle")), False, 0, activation_errors)
+    current = app.ActiveDoc
+    matches = current is not None and document_path_key(str(value(current, "GetPathName") or "")) == document_path_key(str(path))
+    if activated is None or not matches:
         return result(
             False,
             f"Opened {path}, but SOLIDWORKS could not make it active.",
             error_code=int(activation_errors.value),
             document=document_info(doc),
+            active_document=document_info(current) if current is not None else None,
         )
-    return result(True, f"Opened and activated {path}.", document=document_info(app.ActiveDoc))
+    return result(True, f"Opened and activated {path}.", document=document_info(current))
 
 
 @tool(
@@ -302,7 +306,7 @@ def rebuild_document(args: dict[str, Any]) -> dict[str, Any]:
     ["red", "green", "blue"],
 )
 def set_appearance(args: dict[str, Any]) -> dict[str, Any]:
-    from sw_core import as_list, enumerate_faces, get_bodies, safe
+    from .sw_core import as_list, enumerate_faces, get_bodies, safe
 
     _, doc = require_part()
     values = (

@@ -63,7 +63,11 @@ import asyncio
 import json
 import math
 import os
+from contextlib import contextmanager
 from typing import Any
+
+import win32event
+import win32api
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -79,6 +83,12 @@ from . import sw_feature  # noqa: F401
 from . import sw_inspect  # noqa: F401
 from . import sw_assembly  # noqa: F401
 from . import sw_drawing  # noqa: F401
+from . import sw_drawing_geometry  # noqa: F401
+from . import sw_drawing_assets  # noqa: F401
+from . import sw_sheet  # noqa: F401
+from . import sw_surface_ops  # noqa: F401
+from . import sw_annotation_ops  # noqa: F401
+from . import sw_deform
 from . import sw_snapshot  # noqa: F401
 from . import sw_script
 from . import sw_watchdog  # noqa: F401
@@ -112,7 +122,11 @@ READ_ONLY_TOOLS = {
     "set_view", "capture_screenshot", "list_reference_planes", "list_sketches",
     "list_sketch_segments", "get_sketch_status", "list_dimensions", "set_appearance",
     "model_snapshot", "model_diff", "dismiss_dialog", "list_recipes", "get_recipe", "save_recipe",
+    "list_configurations", "list_drawing_entities", "inspect_drawing_assets",
+    "inspect_solidworks_ui", "activate_solidworks_window", "cancel_solidworks_command",
 }
+
+NATIVE_UI_TOOLS = {"inspect_solidworks_ui", "activate_solidworks_window", "cancel_solidworks_command"}
 
 server = Server("solidworks-mcp", instructions=INSTRUCTIONS)
 
@@ -148,7 +162,36 @@ def _safe_light_snapshot() -> dict[str, Any] | None:
         return None
 
 
+@contextmanager
+def _dispatch_mutex():
+    """Serialize this bridge's MCP and CLI processes before any COM call.
+
+    Windows mutex ownership is recursive on the same OS thread, including
+    run_script calls back into dispatch. Manual CAD input is not excluded.
+    """
+    handle = win32event.CreateMutex(None, False, r"Local\SolidWorksMcpDispatcher")
+    acquired = False
+    try:
+        status = win32event.WaitForSingleObject(handle, 1000)
+        if status not in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED):
+            raise RuntimeError("Another Harness process is operating SOLIDWORKS; retry after it finishes.")
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            win32event.ReleaseMutex(handle)
+        win32api.CloseHandle(handle)
+
+
 def dispatch(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        with _dispatch_mutex():
+            return _dispatch_locked(name, arguments)
+    except RuntimeError as exc:
+        return result(False, str(exc))
+
+
+def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     """Run one tool synchronously with the watchdog and auto-diff around it.
 
     Shared with the bench harness so measurements reflect the real server path.
@@ -156,6 +199,27 @@ def dispatch(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     handler = HANDLERS.get(name)
     if handler is None:
         return result(False, f"Unknown tool: {name}")
+
+    try:
+        commands = sw_deform.active_native_commands()
+    except Exception as exc:
+        return result(False, f"Could not inspect native command state safely: {exc}")
+    if commands and name not in NATIVE_UI_TOOLS:
+        return result(False, "Finish the native Deform command before calling a model tool.",
+                      active_commands=commands, command_still_open=True)
+    if name == "create_curve_deform":
+        try:
+            pages = sw_deform.visible_property_managers()
+        except Exception as exc:
+            return result(False, f"Could not inspect native PropertyManager state safely: {exc}")
+        if pages:
+            return result(False, "Close the existing PropertyManager before creating Deform.",
+                          active_commands=pages, command_still_open=True)
+    if name in NATIVE_UI_TOOLS:
+        try:
+            return handler(arguments or {})
+        except Exception as exc:
+            return result(False, str(exc))
 
     try:
         WATCHDOG.configure(running_app())
@@ -186,7 +250,16 @@ def dispatch(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         payload["dialog"] = events
         if payload.get("ok"):
             payload["message"] = f"{payload.get('message', '')} (a modal dialog appeared and was closed; verify the result)"
-    if before is not None:
+    try:
+        remaining_commands = sw_deform.active_native_commands()
+    except Exception as exc:
+        remaining_commands = [{"inspection_error": str(exc)}]
+    if remaining_commands:
+        payload["ok"] = False
+        payload["command_still_open"] = True
+        payload["active_commands"] = remaining_commands
+        payload["message"] = f"{payload.get('message', '')} Native command remains open; automatic model snapshot skipped."
+    if before is not None and not remaining_commands:
         after = _safe_light_snapshot()
         if after is not None and after.get("doc", {}).get("title") == before.get("doc", {}).get("title"):
             text = diff_snapshots(before, after)

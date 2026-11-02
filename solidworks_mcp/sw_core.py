@@ -586,6 +586,39 @@ def active_document() -> tuple[Any, Any]:
     return app, flag_methods(doc, *_MODEL_DOC_METHODS)
 
 
+def document_path_key(path: str) -> str:
+    """Compare Windows document paths independently of slash/case spelling."""
+    import ntpath
+
+    return ntpath.normcase(ntpath.normpath(str(path))) if path else ""
+
+
+def require_document_path(expected_document_path: str, kind: int | None = None) -> tuple[Any, Any]:
+    app, doc = active_document()
+    actual_path = str(value(doc, "GetPathName") or "")
+    actual = document_path_key(actual_path)
+    if expected_document_path.startswith("untitled:"):
+        matches = not actual_path and str(value(doc, "GetTitle")) == expected_document_path[len("untitled:"):]
+    else:
+        expected = document_path_key(expected_document_path)
+        matches = bool(expected) and expected == actual
+    if not matches:
+        raise RuntimeError(f"Active document mismatch: expected '{expected_document_path}', got '{actual}'.")
+    if kind is not None and document_type(doc) != kind:
+        raise RuntimeError(f"Expected document type {kind}, got {document_type(doc)}.")
+    return app, doc
+
+
+def open_document_by_path(app: Any, path: str) -> Any:
+    """Resolve one already-open document without activating, opening, or saving it."""
+    key = document_path_key(path)
+    matches = [d for d in as_list(value(app, "GetDocuments"))
+               if document_path_key(str(value(d, "GetPathName") or "")) == key]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one open document at '{path}', found {len(matches)}.")
+    return flag_methods(matches[0], *_MODEL_DOC_METHODS)
+
+
 def document_type(doc: Any) -> int:
     return int(value(doc, "GetType"))
 
@@ -610,9 +643,12 @@ def document_info(doc: Any) -> dict[str, Any]:
         dirty = bool(value(doc, "GetSaveFlag"))
     except Exception:
         dirty = False
+    title = str(value(doc, "GetTitle"))
+    path = str(value(doc, "GetPathName") or "")
     return {
-        "title": str(value(doc, "GetTitle")),
-        "path": str(value(doc, "GetPathName") or ""),
+        "title": title,
+        "path": path,
+        "document_key": path or f"untitled:{title}",
         "document_type": DOC_TYPES.get(doc_type_num, f"unknown ({doc_type_num})"),
         "dirty": dirty,
     }

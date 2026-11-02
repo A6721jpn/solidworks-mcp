@@ -1,5 +1,16 @@
 # solidworks-mcp
 
+The fork includes drawing, sheet, annotation, surface, and curve deformation
+tools, plus a local CLI. The CLI uses the same dispatcher as the MCP server:
+
+```powershell
+python -m solidworks_mcp.cli list
+python -m solidworks_mcp.cli call inspect_solidworks_ui --arguments-file empty.json
+```
+
+The arguments file for `inspect_solidworks_ui` contains an empty JSON object.
+Native deformation controls require SOLIDWORKS 2026 and an interactive desktop.
+
 > This is A6721jpn's modified fork of
 > [solidworks-mcp by JIALE LIU](https://github.com/Slacker-LLC/solidworks-mcp),
 > based on upstream commit `6019ce0`. It adds batch scripts, snapshots,

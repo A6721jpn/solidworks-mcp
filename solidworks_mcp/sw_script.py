@@ -104,12 +104,22 @@ def _build_env(params: dict[str, Any] | None = None) -> dict[str, Any]:
     except RuntimeError:
         pass
     from . import sw_core, sw_snapshot
+    from .sw_watchdog import WATCHDOG, blocked_report
 
-    def call(name: str, **kwargs: Any) -> dict[str, Any]:
-        handler = HANDLERS.get(name)
+    def call(tool_name: str, /, **kwargs: Any) -> dict[str, Any]:
+        handler = HANDLERS.get(tool_name)
         if handler is None:
-            raise KeyError(f"unknown tool {name}")
-        return handler(kwargs)
+            raise KeyError(f"unknown tool {tool_name}")
+        blocked = blocked_report()
+        if blocked is not None:
+            return blocked
+        cursor = WATCHDOG.event_cursor()
+        payload = handler(kwargs)
+        events = WATCHDOG.events_since(cursor)
+        if events:
+            payload = dict(payload)
+            payload["dialog"] = events
+        return payload
 
     def snapshot(**kwargs: Any) -> str:
         _, current = active_document()
@@ -140,6 +150,9 @@ def _build_env(params: dict[str, Any] | None = None) -> dict[str, Any]:
         "params": dict(params or {}),
         "result": None,
     }
+    conflicts = set(params or {}).intersection(env)
+    if conflicts:
+        raise ValueError(f"Script parameters cannot shadow built-in globals: {sorted(conflicts)}")
     env.update(params or {})
     return env
 
@@ -152,7 +165,12 @@ def execute(code: str, timeout_s: float, params: dict[str, Any] | None = None, l
     except SyntaxError as exc:
         return result(False, f"SyntaxError: {exc.msg} (line {exc.lineno})", line=exc.lineno)
 
-    env = _build_env(params)
+    if params is not None and not isinstance(params, dict):
+        return result(False, "params must be an object.")
+    try:
+        env = _build_env(params)
+    except ValueError as exc:
+        return result(False, str(exc))
     buffer = io.StringIO()
     deadline = time.monotonic() + max(1.0, float(timeout_s))
 
@@ -204,6 +222,7 @@ _SCRIPT_DESCRIPTION = (
     "call(tool_name, **args) to run any tool of this server (e.g. call('boss_extrude', depth_mm=20)), "
     "select(selection_spec), snapshot(), rebuild(), whats_wrong(), mm(x)->metres, to_mm, deg(x)->rad, "
     "to_deg, core (helper module), print() is captured. Assign to `result` to return a value. "
+    "params is an optional object, also exposed as non-reserved globals. "
     "COM units are metres/radians; tools take mm/deg. The result carries a diff of what changed."
 )
 
@@ -214,11 +233,12 @@ _SCRIPT_DESCRIPTION = (
     {
         "code": {"type": "string", "description": "Python source. Keep it short; use call() for tools."},
         "timeout_s": {"type": "number", "default": 120},
+        "params": {"type": "object", "additionalProperties": True, "description": "Data for the snippet; may not shadow built-in script globals."},
     },
     ["code"],
 )
 def run_script(args: dict[str, Any]) -> dict[str, Any]:
-    return execute(str(args["code"]), float(args.get("timeout_s", 120)))
+    return execute(str(args["code"]), float(args.get("timeout_s", 120)), args.get("params"))
 
 
 # --------------------------------------------------------------------------
