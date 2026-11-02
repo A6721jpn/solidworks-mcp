@@ -63,6 +63,7 @@ import asyncio
 import json
 import math
 import os
+from time import perf_counter
 from contextlib import contextmanager
 from typing import Any
 
@@ -79,6 +80,7 @@ from .sw_core import HANDLERS, TOOLS, active_document, com_error, document_type,
 from . import sw_file  # noqa: F401
 from . import sw_refgeom  # noqa: F401
 from . import sw_sketch  # noqa: F401
+from . import sw_sketch_edit  # noqa: F401
 from . import sw_feature  # noqa: F401
 from . import sw_inspect  # noqa: F401
 from . import sw_assembly  # noqa: F401
@@ -114,7 +116,7 @@ INSTRUCTIONS = (
 # Tools whose result gets no auto-diff: they do not change geometry, or they
 # already report the change themselves.
 READ_ONLY_TOOLS = {
-    "solidworks_status", "get_active_document_info", "create_new_document", "open_document",
+    "solidworks_status", "get_active_document_info", "create_new_document", "open_document", "copy_part_document",
     "save_document", "save_active_document", "export_document", "rebuild_document",
     "list_components", "list_mates", "list_sheets", "list_drawing_views", "activate_sheet",
     "activate_drawing_view", "list_faces", "list_edges", "list_vertices", "list_bodies",
@@ -124,6 +126,10 @@ READ_ONLY_TOOLS = {
     "model_snapshot", "model_diff", "dismiss_dialog", "list_recipes", "get_recipe", "save_recipe",
     "list_configurations", "get_sketched_bend", "list_drawing_entities", "inspect_drawing_assets",
     "inspect_solidworks_ui", "activate_solidworks_window", "cancel_solidworks_command",
+}
+
+SCOPED_SKETCH_TOOLS = {
+    "inspect_sketch", "delete_sketch_relations", "rename_dimension", "set_equation", "set_dimensions",
 }
 
 NATIVE_UI_TOOLS = {"inspect_solidworks_ui", "activate_solidworks_window", "cancel_solidworks_command"}
@@ -184,11 +190,18 @@ def _dispatch_mutex():
 
 
 def dispatch(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    started = perf_counter()
     try:
         with _dispatch_mutex():
-            return _dispatch_locked(name, arguments)
+            mutex_ms = (perf_counter() - started) * 1000
+            payload = _dispatch_locked(name, arguments)
     except RuntimeError as exc:
-        return result(False, str(exc))
+        mutex_ms = (perf_counter() - started) * 1000
+        payload = result(False, str(exc))
+        payload["timing_ms"] = {"guards": 0.0, "before_snapshot": 0.0, "handler": 0.0, "after_snapshot": 0.0}
+    payload["timing_ms"]["mutex"] = round(mutex_ms, 3)
+    payload["timing_ms"]["total"] = round((perf_counter() - started) * 1000, 3)
+    return payload
 
 
 def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
@@ -196,30 +209,48 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
 
     Shared with the bench harness so measurements reflect the real server path.
     """
+    started = perf_counter()
+    timing = {"guards": 0.0, "before_snapshot": 0.0, "handler": 0.0, "after_snapshot": 0.0}
+    guard_started = started
+
+    def finish(payload: dict[str, Any]) -> dict[str, Any]:
+        timing["total"] = (perf_counter() - started) * 1000
+        payload["timing_ms"] = {key: round(value, 3) for key, value in timing.items()}
+        return payload
+
     handler = HANDLERS.get(name)
     if handler is None:
-        return result(False, f"Unknown tool: {name}")
+        timing["guards"] += (perf_counter() - guard_started) * 1000
+        return finish(result(False, f"Unknown tool: {name}"))
 
     try:
         commands = sw_deform.active_native_commands()
     except Exception as exc:
-        return result(False, f"Could not inspect native command state safely: {exc}")
+        timing["guards"] += (perf_counter() - guard_started) * 1000
+        return finish(result(False, f"Could not inspect native command state safely: {exc}"))
     if commands and name not in NATIVE_UI_TOOLS:
-        return result(False, "Finish the native Deform command before calling a model tool.",
-                      active_commands=commands, command_still_open=True)
+        timing["guards"] += (perf_counter() - guard_started) * 1000
+        return finish(result(False, "Finish the native Deform command before calling a model tool.",
+                      active_commands=commands, command_still_open=True))
     if name == "create_curve_deform":
         try:
             pages = sw_deform.visible_property_managers()
         except Exception as exc:
-            return result(False, f"Could not inspect native PropertyManager state safely: {exc}")
+            timing["guards"] += (perf_counter() - guard_started) * 1000
+            return finish(result(False, f"Could not inspect native PropertyManager state safely: {exc}"))
         if pages:
-            return result(False, "Close the existing PropertyManager before creating Deform.",
-                          active_commands=pages, command_still_open=True)
+            timing["guards"] += (perf_counter() - guard_started) * 1000
+            return finish(result(False, "Close the existing PropertyManager before creating Deform.",
+                          active_commands=pages, command_still_open=True))
     if name in NATIVE_UI_TOOLS:
+        timing["guards"] += (perf_counter() - guard_started) * 1000
+        handler_started = perf_counter()
         try:
-            return handler(arguments or {})
+            payload = handler(arguments or {})
         except Exception as exc:
-            return result(False, str(exc))
+            payload = result(False, str(exc))
+        timing["handler"] = (perf_counter() - handler_started) * 1000
+        return finish(payload if isinstance(payload, dict) else result(True, str(payload)))
 
     try:
         WATCHDOG.configure(running_app())
@@ -228,11 +259,16 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
     if name != "dismiss_dialog":
         blocked = blocked_report()
         if blocked is not None:
-            return blocked
+            timing["guards"] += (perf_counter() - guard_started) * 1000
+            return finish(blocked)
+    timing["guards"] += (perf_counter() - guard_started) * 1000
 
-    before = _safe_light_snapshot() if AUTO_DIFF and name not in READ_ONLY_TOOLS else None
+    snapshot_started = perf_counter()
+    before = _safe_light_snapshot() if AUTO_DIFF and name not in READ_ONLY_TOOLS and name not in SCOPED_SKETCH_TOOLS else None
+    timing["before_snapshot"] = (perf_counter() - snapshot_started) * 1000
 
     WATCHDOG.begin_call()
+    handler_started = perf_counter()
     try:
         payload = handler(arguments or {})
     except RuntimeError as exc:
@@ -242,6 +278,7 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
     except Exception as exc:
         payload = com_error(exc)
     finally:
+        timing["handler"] = (perf_counter() - handler_started) * 1000
         events = WATCHDOG.end_call()
 
     if not isinstance(payload, dict):
@@ -250,17 +287,21 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
         payload["dialog"] = events
         if payload.get("ok"):
             payload["message"] = f"{payload.get('message', '')} (a modal dialog appeared and was closed; verify the result)"
+    guard_started = perf_counter()
     try:
         remaining_commands = sw_deform.active_native_commands()
     except Exception as exc:
         remaining_commands = [{"inspection_error": str(exc)}]
+    timing["guards"] += (perf_counter() - guard_started) * 1000
     if remaining_commands:
         payload["ok"] = False
         payload["command_still_open"] = True
         payload["active_commands"] = remaining_commands
         payload["message"] = f"{payload.get('message', '')} Native command remains open; automatic model snapshot skipped."
     if before is not None and not remaining_commands:
+        snapshot_started = perf_counter()
         after = _safe_light_snapshot()
+        timing["after_snapshot"] = (perf_counter() - snapshot_started) * 1000
         if after is not None and after.get("doc", {}).get("title") == before.get("doc", {}).get("title"):
             text = diff_snapshots(before, after)
             if text:
@@ -272,7 +313,7 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
                     "volume unchanged after this feature: it may not intersect the model "
                     "(check the sketch plane, direction, or end condition)"
                 )
-    return payload
+    return finish(payload)
 
 
 # Feature tools whose success should move the volume or body count.
