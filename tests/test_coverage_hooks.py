@@ -136,7 +136,7 @@ class CoverageHookTests(unittest.TestCase):
                  tool_input={'code': 'fm.FeatureBossThicken(.00005,0,0,False,False,False,True)'}))
         outcome = self.cli('hook', event=self.event('Stop', turn_id='turn2', stop_hook_active=False))
         self.assertEqual(outcome.get('decision'), 'block')
-        self.assertIn(str(newer), outcome['reason'])
+        self.assertIn(str(newer.resolve()), outcome['reason'])
         self.assertNotIn(older, outcome['reason'])
         self.assertEqual(self.cli('status', '--context', older)['review_receipt']['status'], 'needs_review')
         self.assertIsNone(self.cli('status', '--context', str(newer))['review_receipt'])
