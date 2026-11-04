@@ -33,12 +33,15 @@ from .sw_core import (
     double_array,
     EXPORT_EXTENSIONS,
     extension,
+    flag_methods,
     invoke_no_arg,
+    iter_feature_objects,
     logger,
     nothing,
     OUTPUT_ROOT,
     rebuild,
     require_part,
+    require_document_path,
     result,
     running_app,
     discover_template,
@@ -244,6 +247,66 @@ def save_active_document(args: dict[str, Any]) -> dict[str, Any]:
         saved,
         f"Saved active document to {path}." if saved else "SOLIDWORKS failed to save the active document.",
         path=path,
+    )
+
+
+@tool(
+    "copy_part_document",
+    "Save the active part's current geometry to a new output file without changing its path. "
+    "Restore an active sketch if native SaveAs exits it. Never overwrite or save the source.",
+    {"expected_document_path": {"type": "string"}, "path": {"type": "string"}},
+    ["expected_document_path", "path"],
+)
+def copy_part_document(args: dict[str, Any]) -> dict[str, Any]:
+    app, doc = require_document_path(str(args["expected_document_path"]), 1)
+    output = validated_output_path(str(args["path"]), {".sldprt"})
+    before = document_info(doc)
+    sketch = value(doc.SketchManager, "ActiveSketch")
+    sketch_name = None
+    if sketch is not None:
+        for feature in iter_feature_objects(doc):
+            if str(value(feature, "GetTypeName2")) not in {"ProfileFeature", "3DProfileFeature"}:
+                continue
+            candidate = value(feature, "GetSpecificFeature2")
+            if candidate is not None and int(flag_methods(app, "IsSame").IsSame(sketch, candidate)) == 1:
+                sketch_name = str(value(feature, "Name"))
+                break
+        if sketch_name is None:
+            return result(False, "Cannot identify the open sketch; source was not copied.")
+    errors, warnings = byref_long(0), byref_long(0)
+    saved, failure = False, None
+    try:
+        saved = bool(extension(doc).SaveAs(str(output), 0, 3, nothing(), errors, warnings))
+    except Exception as exc:
+        failure = str(exc)
+    finally:
+        if sketch_name and value(doc.SketchManager, "ActiveSketch") is None:
+            feature = doc.FeatureByName(sketch_name)
+            try:
+                if feature is None or not flag_methods(feature, "Select2").Select2(False, 0):
+                    raise RuntimeError("Could not select the source sketch for restoration.")
+                doc.EditSketch()
+            except Exception as exc:
+                failure = f"Source sketch restoration failed: {exc}"
+    after = document_info(doc)
+    active = value(doc.SketchManager, "ActiveSketch")
+    after_sketch = None
+    if active is not None and sketch_name:
+        expected_sketch = value(doc.FeatureByName(sketch_name), "GetSpecificFeature2")
+        if int(flag_methods(app, "IsSame").IsSame(active, expected_sketch)) == 1:
+            after_sketch = sketch_name
+    source_unchanged = document_path_key(before["path"]) == document_path_key(after["path"])
+    dirty_preserved = not before["dirty"] or after["dirty"]
+    ok = (saved and int(errors.value) == 0 and output.is_file() and source_unchanged
+          and dirty_preserved and after_sketch == sketch_name and failure is None)
+    return result(
+        ok,
+        "Copied part without saving the source." if ok else (failure or "Part copy failed verification."),
+        path=str(output), copied=saved and output.is_file(), source_before=before,
+        source_after=after, source_path_preserved=source_unchanged,
+        unsaved_state_preserved=dirty_preserved,
+        sketch_before=sketch_name, sketch_after=after_sketch,
+        error_code=int(errors.value), warning_code=int(warnings.value),
     )
 
 
