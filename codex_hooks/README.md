@@ -1,38 +1,48 @@
-# SolidWorks MCP coverage hooks
+# CAD review and user-selected improvements
 
-This script supports project-local Codex hooks. It never imports CAD code, connects to SolidWorks, calls an external model, creates a chat, or changes MCP implementation. The active Codex agent performs semantic coverage review. The script validates and persists that review.
+After every completed CAD request, the active agent reviews missing capabilities and opportunities to reduce time or response volume. It presents candidates, waits for the user's selection, then implements and verifies only the selected items.
 
-The parent project's `.codex/hooks.json` should call the script with `--workspace` set to the absolute workspace root, followed by `hook`. Register `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. New hooks must be reviewed and trusted through Codex's native `/hooks` interface. Do not write trust hashes or bypass trust.
+Hooks collect observations, persist state and request continuation. They never call a model, operate CAD, execute evidence files or change source. The registered commands in `.codex/hooks.json` and their trust settings stay unchanged.
 
-## Lifecycle
+## Workflow
 
-`UserPromptSubmit` supplies the exact turn context so the agent can prepare before attempting CAD. Before the first recognizable CAD call, `PreToolUse` requires a preflight record. The agent reads the source catalog and records one entry per intended atomic operation. A declared missing operation permits an already-authorized direct API fallback. This is an internal task check, not a human approval request.
+1. Before CAD, inspect the source `catalog` and connected tools separately, then record atomic coverage with `preflight`. A declared gap permits the already-authorized direct API route.
+2. During CAD, hooks record supported MCP and UI operations. Use `operation-note` for opaque direct API/CLI work and `fallback-note` for unrecognized UI routes.
+3. At the CAD boundary, complete `finish` for coverage. Use `propose` to assess capabilities and efficiency, even without Computer Use. Display the candidate IDs, benefits and acceptance checks, or record why no candidate is useful.
+4. Await the user. `select` binds interpreted numbers/names/all/none to the displayed proposal and latest genuine reply. Previous blanket permission and generated Stop prompts are not selections.
+5. Implement selected scope. `advance` preserves real progress and verified results. Stop continues runnable selected work while it progresses. Selection waits, explicit pauses, blockers and unavailable live checks remain distinct unfinished states.
 
-`PostToolUse` stores bounded operation evidence, including registered `call('tool')` uses, native API candidates, and a local code/command excerpt capped at about 4,000 characters. It does not store whole prompts or transcripts. Using `run_script` is not by itself evidence that a primitive is missing. Code-mode wrapper events are skipped after the nested MCP event path is recognized, avoiding duplicate evidence.
-
-After the main CAD job, the active agent proactively follows [post_work_review.md](post_work_review.md) when UI fallback observations exist. It decides whether an existing capability, stale connection, bug, reusable gap, one-time inspection, or unknown state explains each fallback. Useful feasible local fixes/extensions are already authorized. Their actual source and live behavior must be verified before reporting completion.
-
-`Stop` requests one combined coverage/improvement continuation per context evidence generation. A successful coverage finish accounts for every observed event and native candidate. Confirmed missing primitives become implementation tickets. Uncertain candidates become `needs_review`, while already-covered operations create no extension ticket. The distinct improvement receipt records implementation or an honest pending/no-change outcome. If review does not finish, a repeated Stop saves uncertain candidates and unresolved fallback IDs, then permits exit. It does not repeatedly continue or invent confirmed gaps. Stop does not imply the CAD objective is complete. Reasoned deferral for unfinished/paused/cancelled/superseded/higher-priority work suppresses Stop; a later genuine CAD boundary reminds once without renewing the old allowance.
-An older context falling back to `needs_review` does not suppress a fresh context's first review continuation. When several contexts are pending, only newly requested contexts enter that continuation.
+Read [post_work_review.md](post_work_review.md) for the agent's procedure and [selected_work_contract.md](selected_work_contract.md) for exact input and evidence formats.
 
 ## CLI
 
-Invoke with `python coverage_audit.py --workspace ABSOLUTE_ROOT COMMAND`.
+Invoke `python coverage_audit.py --workspace ABSOLUTE_ROOT COMMAND`. Inputs and evidence must be local workspace artifacts. Descriptions of commands in those files are never executed.
 
-- `catalog` returns source-declared tool names, descriptions, source locations and a digest. It does not prove the live MCP connection has reloaded those tools.
-- `preflight --context AUDIT_JSON --operations OPERATIONS_JSON` records a nonempty operations array. Each entry has `operation`, `status`, `reason`, and `tool` when covered. Status is `covered`, `missing`, or `needs_review`. The first CAD hook supplies the turn-specific audit context path.
-- `status --context AUDIT_JSON` returns current evidence, the existing `evidence_digest`, independent `postwork_digest`, and separate `coverage_status`/`improvement_status`.
-- `finish --context AUDIT_JSON --reviews REVIEWS_JSON` accepts an object containing the current `evidence_digest` and `reviews`. Each review identifies one operation and lists `evidence_ids`, `native_api`, and coverage `status`. Covered reviews name a source tool. Missing or uncertain reviews also supply `proposed_tool`, `reason`, `inputs`, `expected_output`, and `validation`.
-- `fallback-note --context AUDIT_JSON --note NOTE_JSON` records bounded operation/reason/route/kind/attribution/source IDs. Semantic normalization excludes timestamps, deduplicates IDs, and makes replay a no-op. It is the escape hatch for opaque bindings and unhooked direct node-repl paths.
-- `post-work --context AUDIT_JSON --receipt RECEIPT_JSON` classifies exactly every fallback ID and records a digest-bound improvement receipt or reasoned job deferral. See [the workflow](post_work_review.md) for the evidence schema. A fixed/extended result requires current changed-source hashes, a named catalog tool, a real live check, and an artifact asserting successful changed behavior through that live tool. Offline checks alone remain pending-live. Evidence is validated structurally and never executed.
+| Command | Purpose |
+| --- | --- |
+| `catalog` | Source-declared tools, source locations and digest; not a live handshake. |
+| `preflight --context C --operations FILE [--validation-of OWNER]` | Planned atomic operations. Bind selected-improvement validation explicitly to its owner; ordinary CAD stays independent. |
+| `status --context C` | Coverage, workflow, metrics, proposal, selection and remaining work. |
+| `finish --context C --reviews FILE` | Account for observed events/native candidates and create gap tickets. This does not finish the improvement review. |
+| `operation-note --context C --note FILE` | Record opaque authorized CAD work and available measurements. |
+| `fallback-note --context C --note FILE` | Record an unrecognized UI fallback and its reason. |
+| `propose --context C --proposal FILE` | Capability and efficiency assessments, candidates or a justified empty result. |
+| `select --context C --selection FILE` | User selection of a particular displayed proposal. |
+| `advance --context C --update FILE` | Selected-item progress, verification, blocker or explicit pause/resume. |
+| `post-work --context C --receipt FILE` | Version-1 fallback receipts and deferrals. New contexts use `propose`, `select` and `advance`. |
 
-The context and input JSON files must be inside the workspace. Audit records are under `outputs/mcp-coverage-audit/`. Tickets are canonical JSON plus readable Markdown under `tickets/solidworks-mcp/`. Evidence and tickets use OS file locks and atomic file replacement. Repeated reports with the same proposed tool identifier and normalized API set share a ticket and aggregate evidence, even when the wording changes. Later CAD calls invalidate an earlier finish receipt.
+## State and continuation
 
-## Limits
+New contexts use version 2. The original context owns the proposal and selected work across later turns in the same conversation. Historical version-1 records retain their recorded meaning; startup does not reopen all old records. Writes retain per-context locks and atomic replacement.
 
-Source declarations are not a live MCP capability handshake. A stale connection or a failed call is not automatically a missing implementation. The agent must distinguish these cases.
+Coverage and improvement completion are separate. A ticket, source edit or offline test cannot prove a live MCP capability is ready. Verification must match the route declared in the presented candidate and current source. A hook-only change can use an actual hook/CLI protocol check; a CAD capability requires changed behavior through the named live tool.
 
-Detection covers named SolidWorks MCP calls, supported top-level awaited wrappers, explicit COM connection commands, direct CUA, and supported executable CUA/Sky code arguments nested in `functions.exec`. The UI recognizer skips comments, quoted examples/patches, uninvoked functions/arrows, unrelated explicit app targets, and unsupported conditional syntax. It decodes only literal `code` arguments of known tools. It retains no raw UI text, typed values, screenshots, or transcript. Ambiguous persistent bindings produce candidates; an earlier SolidWorks mention cannot confirm their scope. Direct node-repl routes outside the existing matcher need `fallback-note`. This deliberately does not recognize every syntax or route. Existing hook registration and trust state remain unchanged.
+Selected work has no fixed one-continuation ceiling. Actual progress permits additional Stop continuations, including when `stop_hook_active` is true. Repeated prose, timestamps and replay are not progress. Three consecutive boundaries without progress leave an explicit unfinished state instead of looping or claiming success. Session start and later prompts surface owned unfinished work. Saved state does not run a closed app or create a background agent.
 
-Native methods/property writes are evidence candidates. They need semantic review; API names alone cannot determine whether an existing higher-level primitive already covers the action. Tickets represent single operations, not complete drawing workflows.
-`run_script`, `run_recipe`, and `run_macro` cannot be named as coverage for a constituent CAD primitive. They can compose existing commands or provide a fallback, but the audit requires the underlying dedicated CAD command or records a gap.
+## Measurements and limits
+
+Status summarizes observed call count, known processing time and serialized response bytes, including missing-measurement counts. Timing comes from actual response metadata where available. Bytes measure response volume, not actual tokens. Response payloads are not retained for metrics.
+
+Opaque script bodies are not executed or inspected by hooks; record their CAD operations explicitly. A script path or `run_script` call alone does not prove atomic coverage. UI attribution remains bounded and can be uncertain. Keep source declarations, connected tools and actual changed behavior distinct.
+
+The active agent is responsible for truthful presentation, interpreting the actual user reply and performing verification. Stored assertions are validated for identity, scope, freshness and hashes; they are not cryptographic execution proofs. Never invent evidence.
