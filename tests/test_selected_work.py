@@ -14,7 +14,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'codex_hooks/coverage_audit.py'
 class SelectedWorkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.source = self.root/'tools/solidworks-mcp/solidworks_mcp/ops.py'
         self.source.parent.mkdir(parents=True)
         self.source.write_text("@tool('inspect', 'Inspect')\ndef inspect(args): pass\n", encoding='utf-8')
