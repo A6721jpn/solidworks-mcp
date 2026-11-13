@@ -33,6 +33,7 @@ from .sw_core import (
     double_array,
     EXPORT_EXTENSIONS,
     extension,
+    flag_methods,
     invoke_no_arg,
     logger,
     nothing,
@@ -122,6 +123,35 @@ def solidworks_status(args: dict[str, Any]) -> dict[str, Any]:
 def get_active_document_info(args: dict[str, Any]) -> dict[str, Any]:
     _, doc = active_document()
     return result(True, "Read active document.", document=document_info(doc))
+
+
+@tool(
+    "inspect_document_references",
+    "Read the saved model references of a drawing without opening it or switching documents.",
+    {"path": {"type": "string", "description": "Absolute path to a saved SOLIDWORKS drawing."}},
+    ["path"],
+)
+def inspect_document_references(args: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(args["path"])).expanduser()
+    if not path.is_absolute() or path.suffix.lower() != ".slddrw":
+        raise RuntimeError("Provide an absolute path to a saved SOLIDWORKS drawing.")
+    if not path.is_file():
+        raise RuntimeError(f"Drawing does not exist: {path}")
+
+    app = running_app()
+    flag_methods(app, "GetDocumentDependencies2")
+    raw = app.GetDocumentDependencies2(str(path), False, False, False)
+    if raw is not None and not isinstance(raw, (tuple, list)):
+        raise RuntimeError("SOLIDWORKS returned incomplete drawing reference data.")
+    entries = list(raw) if raw is not None else []
+    if len(entries) % 2 or any(not isinstance(item, str) or not item for item in entries):
+        raise RuntimeError("SOLIDWORKS returned incomplete drawing reference data.")
+    references = [
+        {"name": entries[i], "path": entries[i + 1], "exists": Path(entries[i + 1]).is_file()}
+        for i in range(0, len(entries), 2)
+    ]
+    message = "Read saved drawing references." if references else "SOLIDWORKS returned no saved drawing references."
+    return result(True, message, drawing_path=str(path), references=references)
 
 
 @tool(
