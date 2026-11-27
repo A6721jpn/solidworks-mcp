@@ -1,4 +1,3 @@
-# Modified in the A6721jpn fork. See FORK.md for the changes.
 # Copyright 2026 JIALE LIU
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +30,7 @@ from .sw_core import (
     dispatch_array,
     empty_variant,
     dimension_dialog_suppressed,
+    document_path_key,
     as_list,
     apply_selection,
     clear_selection,
@@ -160,12 +160,16 @@ def create_sketch(args: dict[str, Any]) -> dict[str, Any]:
     name = args.get("name")
     created = ""
     try:
-        created, feature = latest_sketch(doc)
+        created = str(value(doc.SketchManager.ActiveSketch, "Name"))
+        feature = flag_methods(doc, "FeatureByName").FeatureByName(created)
+        if feature is None:
+            raise RuntimeError("Cannot resolve the newly opened sketch feature.")
         if name:
             feature.Name = str(name)
             created = str(name)
-    except Exception:
-        logger.info("Sketch opened but its feature could not be resolved for renaming.")
+    except Exception as exc:
+        return result(False, f"Opened a sketch, but could not identify or rename it: {exc}",
+                      sketch_open=True, may_have_changes=True)
     return result(True, f"Opened a sketch on {target}.", sketch=created, target=target)
 
 
@@ -690,15 +694,43 @@ def sketch_mirror(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "convert_entities",
-    "Project the selected model edges or a face's loops onto the open sketch (Convert Entities).",
+    "Project selected edges onto the open sketch. With sync, plan or apply native projected-profile "
+    "synchronization between named closed sketches. Sync requires chain=false and inner_loops=false.",
     {
         "selection": SELECTION_SCHEMA,
         "chain": {"type": "boolean", "default": True},
         "inner_loops": {"type": "boolean", "default": False},
+        "sync": {
+            "type": "object",
+            "properties": {
+                "expected_document_path": {"type": "string", "minLength": 1},
+                "expected_configuration": {"type": "string", "minLength": 1},
+                "target_sketch": {"type": "string", "minLength": 1},
+                "protected_target_segments": {
+                    "type": "array", "uniqueItems": True,
+                    "description": "Stable target native identities from segment type and GetID, never enumeration indices.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "integer", "minimum": 0},
+                            "id": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                        },
+                        "required": ["type", "id"], "additionalProperties": False,
+                    },
+                },
+                "rollback_before": {"type": "string", "minLength": 1},
+                "apply": {"type": "boolean", "default": False},
+            },
+            "required": ["expected_document_path", "expected_configuration", "target_sketch", "protected_target_segments"],
+            "additionalProperties": False,
+        },
     },
     ["selection"],
 )
 def convert_entities(args: dict[str, Any]) -> dict[str, Any]:
+    if "sync" in args:
+        from ._profile_sync import synchronize
+        return synchronize(args)
     doc, manager = _require_open_sketch()
     require_selection(doc, args["selection"])
     ok = bool(manager.SketchUseEdge3(bool(args.get("chain", True)), bool(args.get("inner_loops", False))))
@@ -733,6 +765,181 @@ def set_construction_geometry(args: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+_DRAWING_ORIGIN_SELECTION = {
+    **SELECTION_SCHEMA,
+    "properties": {
+        **SELECTION_SCHEMA["properties"],
+        "drawing_model_origin": {
+            "type": "object",
+            "description": "Constrain one view-sketch line to its referenced model origin. Coordinates are in the view sketch, in mm.",
+            "properties": {
+                "expected_document_path": {"type": "string", "minLength": 1},
+                "view_name": {"type": "string", "minLength": 1},
+                "expected_model_path": {"type": "string", "minLength": 1},
+                "expected_configuration": {"type": "string", "minLength": 1},
+                "segment_id": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                "expected_endpoints_mm": {
+                    "type": "array", "minItems": 2, "maxItems": 2,
+                    "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                },
+                "tolerance_mm": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.05, "default": 0.001,
+                                 "description": "Endpoint guard tolerance in mm; accepts the rounded list_sketch_segments output."},
+            },
+            "required": ["expected_document_path", "view_name", "expected_model_path", "expected_configuration", "segment_id", "expected_endpoints_mm"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _origin_line_matches(app: Any, manager: Any, sketch: Any, line_id: list[int], origin: Any) -> list[Any]:
+    matches = []
+    for relation in as_list(flag_methods(manager, "GetRelations").GetRelations(0)):
+        if int(value(relation, "GetRelationType")) != RELATIONS["coincident"]:
+            continue
+        entities = as_list(value(relation, "GetDefinitionEntities"))
+        if len(entities) != 2 or any(entity is None for entity in entities):
+            continue
+        has_origin = any(int(app.IsSame(entity, origin)) == 1 for entity in entities)
+        has_line = any(
+            list(safe(entity, "GetID") or []) == line_id
+            and safe(entity, "GetSketch") is not None
+            and int(app.IsSame(value(entity, "GetSketch"), sketch)) == 1
+            for entity in entities
+        )
+        if has_origin and has_line:
+            matches.append(relation)
+    return matches
+
+
+def _add_drawing_origin_relation(args: dict[str, Any]) -> dict[str, Any]:
+    from .sw_drawing_geometry import find_view
+
+    spec = args["selection"]
+    target = spec["drawing_model_origin"]
+    if args["relation"] != "coincident" or set(spec) != {"sketch_segments", "drawing_model_origin"}:
+        raise RuntimeError("Drawing model origin requires coincident and exactly one sketch_segments selection.")
+    indices = spec["sketch_segments"]
+    if not isinstance(indices, list) or len(indices) != 1 or not isinstance(indices[0], int) or indices[0] < 0:
+        raise RuntimeError("Select exactly one nonnegative view-sketch segment index.")
+    line_id = list(target["segment_id"])
+    expected = target["expected_endpoints_mm"]
+    tolerance = float(target.get("tolerance_mm", 0.001))
+    if (len(line_id) != 2 or any(not isinstance(i, int) for i in line_id)
+            or len(expected) != 2 or any(len(p) != 3 for p in expected)
+            or not 0 < tolerance <= 0.05 or not math.isfinite(tolerance)
+            or any(not math.isfinite(float(x)) for p in expected for x in p)):
+        raise RuntimeError("Invalid line identity, endpoint guard, or tolerance.")
+
+    app, doc = require_document_path(str(target["expected_document_path"]), 3)
+    app = flag_methods(app, "IsSame")
+    view = find_view(doc, str(target["view_name"]))
+    model_path = str(value(view, "GetReferencedModelName") or "")
+    if document_path_key(model_path) != document_path_key(str(target["expected_model_path"])):
+        raise RuntimeError("Drawing view references a different model.")
+    if str(value(view, "ReferencedConfiguration")) != str(target["expected_configuration"]):
+        raise RuntimeError("Drawing view references a different configuration.")
+    model = value(view, "ReferencedDocument")
+    if model is None or document_path_key(str(value(model, "GetPathName") or "")) != document_path_key(model_path):
+        raise RuntimeError("Referenced model is not open with the expected path.")
+    sketch = value(view, "GetSketch")
+    active = doc.SketchManager.ActiveSketch
+    if active is not None and int(app.IsSame(active, sketch)) != 1:
+        raise RuntimeError("A different sketch is being edited; refusing to switch it.")
+    if not flag_methods(doc, "ActivateView").ActivateView(str(target["view_name"])):
+        raise RuntimeError("Could not activate the requested drawing view.")
+    active = doc.SketchManager.ActiveSketch
+    if active is None or int(app.IsSame(active, sketch)) != 1:
+        raise RuntimeError("The active sketch is not the requested drawing view sketch.")
+
+    segments = as_list(value(sketch, "GetSketchSegments"))
+    if indices[0] >= len(segments):
+        raise RuntimeError("The selected segment index is out of range.")
+    line = segments[indices[0]]
+    if int(value(line, "GetType")) != 0 or list(value(line, "GetID")) != line_id:
+        raise RuntimeError("The selected line no longer matches its native ID.")
+    ends = [value(line, "GetStartPoint2"), value(line, "GetEndPoint2")]
+    def line_points() -> list[list[float]]:
+        return [[to_mm(float(value(p, k))) for k in ("X", "Y", "Z")] for p in ends]
+    before_points = line_points()
+    if any(abs(actual - float(wanted)) > tolerance
+           for a, b in zip(before_points, expected) for actual, wanted in zip(a, b)):
+        raise RuntimeError("The selected line endpoints changed since inspection.")
+    if math.dist(before_points[0][:2], before_points[1][:2]) <= tolerance:
+        raise RuntimeError("The selected line is degenerate.")
+
+    origins = [f for f in iter_feature_objects(model) if str(feature_property(f, "GetTypeName2", "")) == "OriginProfileFeature"]
+    if len(origins) != 1:
+        raise RuntimeError("The referenced model does not have exactly one origin feature.")
+    corresponding = flag_methods(view, "GetCorresponding").GetCorresponding(origins[0])
+    if corresponding is None:
+        raise RuntimeError("Could not resolve the model origin in the drawing view.")
+    points = as_list(value(value(corresponding, "GetSpecificFeature2"), "GetSketchPoints2"))
+    if len(points) != 1:
+        raise RuntimeError("The drawing-view model origin is ambiguous.")
+    origin = points[0]
+    manager = flag_methods(value(sketch, "RelationManager"), "GetRelationsCount", "GetRelations")
+    before_count = int(manager.GetRelationsCount(0))
+    before_status = int(value(sketch, "GetConstrainedStatus"))
+    if before_status not in (2, 3):
+        raise RuntimeError("The view sketch is not in a solved state.")
+    if _origin_line_matches(app, manager, sketch, line_id, origin):
+        raise RuntimeError("The requested line is already coincident with the model origin.")
+
+    sm = flag_methods(value(doc, "SelectionManager"), "CreateSelectData", "GetSelectedObjectCount2",
+                      "GetSelectedObjectType3", "GetSelectedObjectsDrawingView2")
+    clear_selection(doc)
+    try:
+        first = sm.CreateSelectData()
+        first.View = view
+        second = sm.CreateSelectData()
+        second.View = view
+        selected = bool(flag_methods(origin, "Select4").Select4(False, first))
+        selected = bool(flag_methods(line, "Select4").Select4(True, second)) and selected
+        count = int(sm.GetSelectedObjectCount2(-1))
+        types = [int(sm.GetSelectedObjectType3(i, -1)) for i in range(1, count + 1)]
+        views = [sm.GetSelectedObjectsDrawingView2(i, -1) for i in range(1, count + 1)]
+        if not selected or types != [25, 10] or any(v is None or int(app.IsSame(v, view)) != 1 for v in views):
+            raise RuntimeError("Could not select the model origin and line in the requested view.")
+        try:
+            flag_methods(doc, "SketchAddConstraints").SketchAddConstraints("sgCOINCIDENT")
+        except Exception as exc:
+            return result(False, f"SOLIDWORKS could not apply the relation: {exc}", partial=True,
+                          relations_before=before_count, relations_after=int(manager.GetRelationsCount(0)))
+    finally:
+        clear_selection(doc)
+
+    def transform(p: list[float], matrix: list[float]) -> list[float]:
+        if len(matrix) < 13 or any(not math.isfinite(float(x)) for x in matrix[:13]):
+            raise RuntimeError("Missing drawing view transform.")
+        return [sum(p[j] * matrix[j * 3 + i] for j in range(3)) * matrix[12] + matrix[9 + i] for i in range(3)]
+    try:
+        rebuilt = rebuild(doc)
+        after_count = int(manager.GetRelationsCount(0))
+        status = int(value(sketch, "GetConstrainedStatus"))
+        matches = _origin_line_matches(app, manager, sketch, line_id, origin)
+        after_points = line_points()
+        sheet_origin = transform([0.0, 0.0, 0.0], list(value(value(view, "ModelToViewTransform"), "ArrayData")))
+        sketch_origin = [to_mm(p) for p in transform(sheet_origin, list(value(value(sketch, "ModelToSketchTransform"), "ArrayData")))]
+        (x1, y1), (x2, y2) = [p[:2] for p in after_points]
+        length = math.hypot(x2-x1, y2-y1)
+        if length <= 0:
+            raise RuntimeError("The line became degenerate.")
+        distance = abs((x2-x1)*(y1-sketch_origin[1]) - (y2-y1)*(x1-sketch_origin[0])) / length
+    except Exception as exc:
+        return result(False, f"The relation was attempted but verification failed: {exc}",
+                      partial=True, view_name=str(target["view_name"]), line_id=line_id,
+                      relations_before=before_count, line_before_mm=before_points)
+    verified = rebuilt and after_count == before_count + 1 and len(matches) == 1 and status in (2, 3) and distance <= 0.00001
+    return result(verified, "Added and verified the line-to-model-origin relation." if verified else
+                  "The operation did not pass verification; inspect the drawing before further changes.",
+                  partial=not verified, view_name=str(target["view_name"]), line_id=line_id,
+                  relations_before=before_count, relations_after=after_count,
+                  matching_relations=len(matches), sketch_status_before=before_status, sketch_status=status,
+                  rebuilt=rebuilt, line_before_mm=before_points, line_after_mm=after_points,
+                  projected_origin_mm=sketch_origin, distance_mm=distance)
+
+
 def _relation_entities(doc: Any, spec: dict[str, Any]) -> list[Any]:
     """Resolve a selection spec to the sketch objects AddRelation wants."""
     sketch_name = spec.get("sketch_name")
@@ -758,14 +965,17 @@ def _relation_entities(doc: Any, spec: dict[str, Any]) -> list[Any]:
     "add_relation",
     "Add a geometric relation between the selected sketch entities. This is what makes a sketch "
     "fully defined and driveable, so add relations before dimensions. Select the entities via "
-    "selection (sketch_segments / sketch_points), then name the relation.",
+    "selection (sketch_segments / sketch_points), then name the relation. For a drawing view line "
+    "and its referenced model origin, supply selection.drawing_model_origin with exact view, model and line guards.",
     {
         "relation": {"type": "string", "enum": sorted(RELATIONS), "description": "Geometric relation to add."},
-        "selection": SELECTION_SCHEMA,
+        "selection": _DRAWING_ORIGIN_SELECTION,
     },
     ["relation", "selection"],
 )
 def add_relation(args: dict[str, Any]) -> dict[str, Any]:
+    if "drawing_model_origin" in args.get("selection", {}):
+        return _add_drawing_origin_relation(args)
     doc, _ = _require_open_sketch()
     relation = str(args["relation"])
     code = RELATIONS[relation]

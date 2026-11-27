@@ -1,4 +1,3 @@
-# Modified in the A6721jpn fork. See FORK.md for the changes.
 # Copyright 2026 JIALE LIU
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,16 +31,18 @@ from .sw_core import (
     active_document,
     apply_selection,
     apply_transform,
+    as_list,
     byref_long,
     clear_selection,
+    component_transform,
     document_type,
+    empty_variant,
     enumerate_edges,
     enumerate_faces,
     enumerate_vertices,
     extension,
     flag_methods,
     invoke_no_arg,
-    iter_body_context,
     iter_features,
     logger,
     mm_point,
@@ -199,24 +200,226 @@ def list_vertices(args: dict[str, Any]) -> dict[str, Any]:
     return result(True, f"Read {len(vertices)} vertices.", vertices=_strip_internal(vertices))
 
 
-@tool("list_bodies", "Read-only: list the solid bodies of the active part or assembly.", {})
+def _body_contexts(doc: Any, include_surfaces: bool) -> tuple[list, list, list[str]]:
+    """Preserve the legacy solid traversal, but retain enumeration failures."""
+    solids: list = []
+    surfaces: list = []
+    errors: list[str] = []
+    kind = document_type(doc)
+    if kind == 1:
+        for body_type, target in ((0, solids), (1, surfaces)):
+            if body_type == 1 and not include_surfaces:
+                continue
+            try:
+                raw = doc.GetBodies2(body_type, False)
+                if isinstance(raw, (list, tuple)) and any(body is None for body in raw):
+                    errors.append(f"Null {'solid' if body_type == 0 else 'surface'} body in enumeration")
+                target.extend((body, str(safe(body, "Name", "")), None, body_type) for body in as_list(raw))
+            except Exception as exc:
+                errors.append(f"Could not enumerate {'solid' if body_type == 0 else 'surface'} bodies: {exc}")
+        return solids, surfaces, errors
+    if kind != 2:
+        return solids, surfaces, ["Body enumeration requires a part or assembly document"]
+
+    try:
+        components = doc.GetComponents(False)
+        if isinstance(components, (list, tuple)) and any(item is None for item in components):
+            errors.append("Null component in enumeration")
+    except Exception as exc:
+        return solids, surfaces, [f"Could not enumerate assembly components: {exc}"]
+
+    for component in as_list(components):
+        try:
+            suppressed = value(component, "IsSuppressed")
+            if suppressed is None:
+                errors.append("Could not determine whether a component is suppressed")
+            if bool(suppressed):
+                continue
+        except Exception:
+            errors.append("Could not determine whether a component is suppressed")
+        label = str(safe(component, "Name2", "") or "")
+        matrix = component_transform(component)
+        for body_type, target in ((0, solids), (1, surfaces)):
+            if body_type == 1 and not include_surfaces:
+                continue
+            typed = True
+            try:
+                raw = flag_methods(component, "GetBodies3").GetBodies3(body_type, empty_variant())
+                if isinstance(raw, (list, tuple)) and any(body is None for body in raw):
+                    errors.append(f"Null body in component {label!r}")
+                bodies = as_list(raw)
+            except Exception as exc:
+                errors.append(f"Could not enumerate component {label!r} bodies of type {body_type}: {exc}")
+                bodies = []
+            # The legacy solid traversal uses GetBody as a fallback even when
+            # GetBodies3 returns an empty array. Its body type is not guaranteed.
+            if body_type == 0 and not bodies:
+                typed = False
+                try:
+                    bodies = as_list(value(component, "GetBody"))
+                except Exception as exc:
+                    errors.append(f"Could not read fallback body of component {label!r}: {exc}")
+            for body in bodies:
+                target.append((body, f"{label}/{safe(body, 'Name', '')}", matrix, body_type if typed else None))
+    return solids, surfaces, errors
+
+
+def _body_entry(context: tuple, index: int, surface: bool = False) -> dict[str, Any]:
+    body, label, matrix, type_hint = context
+    try:
+        raw_type = value(body, "GetType")
+        body_type = int(raw_type) if raw_type is not None else type_hint
+    except Exception:
+        body_type = type_hint
+    type_names = {0: "solid", 1: "surface", 2: "wire", 3: "point", 4: "general", 5: "empty", 6: "mesh", 7: "graphics"}
+    try:
+        raw_visible = value(body, "Visible")
+        visible = bool(raw_visible) if isinstance(raw_visible, (bool, int)) and raw_visible in (-1, 0, 1) else None
+    except Exception:
+        visible = None
+    entry: dict[str, Any] = {
+        "surface_index" if surface else "index": index,
+        "name": label or f"body{index}",
+        "body_type": type_names.get(body_type, "unknown"),
+        "visible": visible,
+    }
+    box = safe(body, "GetBodyBox")
+    if box is not None and len(box) >= 6:
+        entry["min_mm"] = mm_point(apply_transform(box[0:3], matrix))
+        entry["max_mm"] = mm_point(apply_transform(box[3:6], matrix))
+    return entry
+
+
+@tool(
+    "list_bodies",
+    "Read-only: list bodies in the active part or assembly. The bodies array preserves legacy "
+    "solid-selection indices; body_type and body-level visible (true, false, or null if unknown) "
+    "describe each body. Optional surface bodies are returned in a separate array and their "
+    "surface_index is not a solid-selection index. Assembly component visibility is not included.",
+    {"include_surfaces": {"type": "boolean", "default": False, "description": "Also return surface bodies separately."}},
+)
 def list_bodies(args: dict[str, Any]) -> dict[str, Any]:
     _, doc = active_document()
-    bodies = []
-    for index, (body, label, matrix) in enumerate(iter_body_context(doc)):
-        entry: dict[str, Any] = {"index": index, "name": label or f"body{index}"}
-        box = safe(body, "GetBodyBox")
-        if box is not None and len(box) >= 6:
-            entry["min_mm"] = mm_point(apply_transform(box[0:3], matrix))
-            entry["max_mm"] = mm_point(apply_transform(box[3:6], matrix))
-        bodies.append(entry)
-    return result(True, f"Read {len(bodies)} solid bodies.", bodies=bodies)
+    include_surfaces = bool(args.get("include_surfaces", False))
+    solid_contexts, surface_contexts, errors = _body_contexts(doc, include_surfaces)
+    bodies = [_body_entry(context, index) for index, context in enumerate(solid_contexts)]
+    data: dict[str, Any] = {"bodies": bodies, "complete": not errors}
+    if include_surfaces:
+        data["surface_bodies"] = [_body_entry(context, index, True) for index, context in enumerate(surface_contexts)]
+    if errors:
+        data["read_errors"] = errors
+    return result(not errors, f"Read {len(bodies)} bodies in the legacy solid traversal" + (" (incomplete)." if errors else "."), **data)
 
 
-@tool("list_features", "Read-only: list the active document feature tree in order.", {})
+_FEATURE_FACE_LIMIT = 1000
+_FEATURE_RELATION_LIMIT = 100
+
+
+def _feature_relation_names(feature: Any, member: str, count_member: str) -> tuple[list[str] | None, bool]:
+    try:
+        raw = value(feature, member)
+    except Exception:
+        return None, False
+    if raw is None:
+        try:
+            return ([], True) if int(value(feature, count_member)) == 0 else (None, False)
+        except Exception:
+            return None, False
+    items = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+    complete = len(items) <= _FEATURE_RELATION_LIMIT
+    names: list[str] = []
+    for related in items[:_FEATURE_RELATION_LIMIT]:
+        try:
+            name = value(related, "Name") if related is not None else None
+            if not isinstance(name, str) or not name:
+                complete = False
+            else:
+                names.append(name)
+        except Exception:
+            complete = False
+    return names, complete
+
+
+def _feature_faces(feature: Any) -> tuple[int | None, list[str] | None, bool, int]:
+    try:
+        native_count = int(value(feature, "GetFaceCount"))
+        if native_count < 0:
+            native_count = None
+    except Exception:
+        native_count = None
+    try:
+        raw = value(feature, "GetFaces")
+    except Exception:
+        return native_count, None, False, 0
+    if raw is None:
+        return native_count, [] if native_count == 0 else None, native_count == 0, 0
+    faces = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+    count = len(faces) if native_count is None else native_count
+    complete = len(faces) <= _FEATURE_FACE_LIMIT and len(faces) == count
+    if len(faces) != count:
+        count = None
+    names: list[str] = []
+    for face in faces[:_FEATURE_FACE_LIMIT]:
+        try:
+            body = value(face, "GetBody") if face is not None else None
+            name = value(body, "Name") if body is not None else None
+            if not isinstance(name, str) or not name:
+                complete = False
+            elif name not in names:
+                names.append(name)
+        except Exception:
+            complete = False
+    return count, names, complete, min(len(faces), _FEATURE_FACE_LIMIT)
+
+
+@tool(
+    "list_features",
+    "Read-only: list the active document's model features in order. Supply feature_name for an "
+    "exact name from that list to inspect its current owned-face count, distinct owning body names, "
+    "and direct feature parents and children. Body names are examined for at most 1000 faces; "
+    "completeness flags and null distinguish partial or unknown reads.",
+    {"feature_name": {"type": "string", "description": "Exact feature name from the unfiltered list."}},
+)
 def list_features(args: dict[str, Any]) -> dict[str, Any]:
     _, doc = active_document()
-    return result(True, "Read feature tree.", features=iter_features(doc))
+    if "feature_name" not in args:
+        return result(True, "Read feature tree.", features=iter_features(doc))
+    name = args["feature_name"]
+    if not isinstance(name, str) or not name:
+        return result(False, "feature_name must be a nonempty exact name.")
+    matches = []
+    try:
+        feature = value(doc, "FirstFeature")
+        visited = 0
+        while feature is not None:
+            visited += 1
+            if visited > 10000:
+                return result(False, "Feature enumeration exceeded its limit; the exact name cannot be resolved safely.")
+            current_name = value(feature, "Name")
+            if not isinstance(current_name, str):
+                return result(False, "A feature name could not be read; the exact name cannot be resolved safely.")
+            if current_name == name:
+                matches.append(feature)
+                if len(matches) > 1:
+                    return result(False, f"Feature name {name!r} is ambiguous in the active document.")
+            feature = value(feature, "GetNextFeature")
+    except Exception as exc:
+        return result(False, f"Could not enumerate features to resolve {name!r}: {exc}")
+    if not matches:
+        return result(False, f"No feature named {name!r} was found in the model feature list.")
+    feature = matches[0]
+    face_count, body_names, bodies_complete, examined = _feature_faces(feature)
+    parents, parents_complete = _feature_relation_names(feature, "GetParents", "IGetParentCount")
+    children, children_complete = _feature_relation_names(feature, "GetChildren", "IGetChildCount")
+    feature_type = safe(feature, "GetTypeName2")
+    details = {
+        "name": name, "type": str(feature_type) if feature_type is not None else None,
+        "face_count": face_count, "body_names": body_names, "body_names_complete": bodies_complete,
+        "faces_examined": examined, "parents": parents, "parents_complete": parents_complete,
+        "children": children, "children_complete": children_complete,
+    }
+    complete = face_count is not None and bodies_complete and parents_complete and children_complete
+    return result(True, "Read feature details." if complete else "Read feature details; some results are incomplete or unknown.", feature=details)
 
 
 # --------------------------------------------------------------------------

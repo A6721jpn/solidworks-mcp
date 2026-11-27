@@ -29,8 +29,10 @@ cross-thread.  Set SW_MCP_AUTO_DISMISS_DIALOGS=0 to only report, never close.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
+import unicodedata
 from typing import Any
 
 import win32con
@@ -44,6 +46,14 @@ _AUTO_DISMISS = os.environ.get("SW_MCP_AUTO_DISMISS_DIALOGS", "1") != "0"
 _POLL_S = 0.5
 
 _IDOK, _IDCANCEL = 1, 2
+
+
+def _is_open_progress(window: dict[str, Any]) -> bool:
+    title = unicodedata.normalize("NFKC", str(window.get("title") or "")).strip().casefold()
+    text = unicodedata.normalize("NFKC", str(window.get("text") or ""))
+    if title == "open progress...":
+        return True
+    return not title and bool(re.search(r"\d+\s*/\s*\d+\s*のファイルを開いています", text)) and "経過時間" in text
 
 
 class DialogWatchdog:
@@ -183,36 +193,43 @@ class DialogWatchdog:
             return list(self.events[cursor:])
 
     def _loop(self) -> None:
-        blocked_since: float | None = None
+        first_seen: dict[int, float] = {}
         handled: set[int] = set()
         while not self._stop.is_set():
             if not self._active.is_set():
-                blocked_since = None
+                first_seen.clear()
                 handled.clear()
                 time.sleep(_POLL_S)
                 continue
             try:
                 if self.is_blocked():
                     now = time.monotonic()
-                    blocked_since = blocked_since or now
-                    if now - blocked_since >= _TIMEOUT_S:
-                        for window in self.modal_windows():
-                            if window["hwnd"] in handled:
-                                continue
-                            handled.add(window["hwnd"])
-                            event = {
-                                "title": window["title"],
-                                "text": window["text"],
-                                "waited_s": round(now - blocked_since, 1),
-                                "action": "closed" if _AUTO_DISMISS else "reported",
-                            }
-                            logger.warning("Modal dialog during tool call: %s | %s", window["title"], window["text"][:120])
-                            if _AUTO_DISMISS:
-                                self.dismiss(window["hwnd"], "close")
-                            with self._lock:
-                                self.events.append(event)
+                    windows = self.modal_windows()
+                    present = {window["hwnd"] for window in windows}
+                    first_seen = {hwnd: started for hwnd, started in first_seen.items() if hwnd in present}
+                    handled.intersection_update(present)
+                    for window in windows:
+                        hwnd = window["hwnd"]
+                        if _is_open_progress(window):
+                            first_seen.pop(hwnd, None)
+                            continue
+                        started = first_seen.setdefault(hwnd, now)
+                        if hwnd in handled or now - started < _TIMEOUT_S:
+                            continue
+                        handled.add(hwnd)
+                        event = {
+                            "title": window["title"],
+                            "text": window["text"],
+                            "waited_s": round(now - started, 1),
+                            "action": "closed" if _AUTO_DISMISS else "reported",
+                        }
+                        logger.warning("Modal dialog during tool call: %s | %s", window["title"], window["text"][:120])
+                        if _AUTO_DISMISS:
+                            self.dismiss(hwnd, "close")
+                        with self._lock:
+                            self.events.append(event)
                 else:
-                    blocked_since = None
+                    first_seen.clear()
                     handled.clear()
             except Exception:
                 logger.debug("watchdog poll failed", exc_info=True)
@@ -227,6 +244,10 @@ def blocked_report() -> dict[str, Any] | None:
     if not WATCHDOG.is_blocked():
         return None
     windows = WATCHDOG.modal_windows()
+    progress = [w for w in windows if _is_open_progress(w)]
+    windows = [w for w in windows if not _is_open_progress(w)]
+    if progress and not windows:
+        return result(False, "SOLIDWORKS is opening a document; wait for it to finish.", opening_document=True)
     summary = "; ".join(f"'{w['title']}' {w['text']}".strip() for w in windows) or "an unidentified modal window"
     return result(
         False,
@@ -247,7 +268,7 @@ def blocked_report() -> dict[str, Any] | None:
 def dismiss_dialog(args: dict[str, Any]) -> dict[str, Any]:
     if WATCHDOG.pid is None:
         WATCHDOG.configure(running_app())
-    windows = WATCHDOG.modal_windows()
+    windows = [w for w in WATCHDOG.modal_windows() if not _is_open_progress(w)]
     needle = str(args.get("title_contains") or "").lower()
     if needle:
         windows = [w for w in windows if needle in (w["title"] or "").lower()]

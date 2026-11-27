@@ -117,8 +117,8 @@ INSTRUCTIONS = (
 # Tools whose result gets no auto-diff: they do not change geometry, or they
 # already report the change themselves.
 READ_ONLY_TOOLS = {
-    "solidworks_status", "get_active_document_info", "inspect_document_references", "create_new_document", "open_document",
-    "copy_part_document",
+    "solidworks_status", "get_active_document_info", "inspect_document_references",
+    "replace_drawing_reference", "create_new_document", "open_document", "copy_part_document",
     "save_document", "save_active_document", "export_document", "rebuild_document",
     "list_components", "list_mates", "list_sheets", "list_drawing_views", "activate_sheet",
     "activate_drawing_view", "list_faces", "list_edges", "list_vertices", "list_bodies",
@@ -154,7 +154,7 @@ def compact_numbers(obj: Any) -> Any:
             return 0.0
         return float(f"{obj:.6g}")
     if isinstance(obj, dict):
-        return {k: compact_numbers(v) for k, v in obj.items()}
+        return {k: v if k == "pose" else compact_numbers(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [compact_numbers(v) for v in obj]
     return obj
@@ -266,7 +266,8 @@ def _dispatch_locked(name: str, arguments: dict[str, Any] | None) -> dict[str, A
     timing["guards"] += (perf_counter() - guard_started) * 1000
 
     snapshot_started = perf_counter()
-    before = _safe_light_snapshot() if AUTO_DIFF and name not in READ_ONLY_TOOLS and name not in SCOPED_SKETCH_TOOLS else None
+    profile_sync = name == "convert_entities" and "sync" in (arguments or {})
+    before = _safe_light_snapshot() if AUTO_DIFF and name not in READ_ONLY_TOOLS and name not in SCOPED_SKETCH_TOOLS and not profile_sync else None
     timing["before_snapshot"] = (perf_counter() - snapshot_started) * 1000
 
     WATCHDOG.begin_call()

@@ -244,34 +244,73 @@ def _view_entry(view: Any, index: int) -> dict[str, Any]:
 
 @tool(
     "create_drawing",
-    "Create a new drawing document from the configured default template, optionally sized and "
-    "scaled. Then use insert_standard_views or insert_model_view to place views.",
+    "Create a new drawing from an explicit DRWDOT or the configured default template. "
+    "Omitted sheet settings inherit the template. Does not change global defaults or save.",
     {
+        "template_path": {"type": "string", "description": "Absolute path to an existing .drwdot drawing template."},
         "paper_size": {"type": "string", "enum": sorted(PAPER_SIZES), "description": "Override the template's paper size."},
-        "scale_numerator": {"type": "number", "default": 1},
-        "scale_denominator": {"type": "number", "default": 1},
+        "scale_numerator": {"type": "number", "exclusiveMinimum": 0},
+        "scale_denominator": {"type": "number", "exclusiveMinimum": 0},
         "first_angle": {"type": "boolean", "description": "True for first-angle (ISO/GB) projection, false for third-angle."},
     },
 )
 def create_drawing(args: dict[str, Any]) -> dict[str, Any]:
-    created = new_document("drawing")
-    if not created.get("ok"):
-        return created
-    _, doc = require_drawing()
+    template_path = None
+    if "template_path" in args:
+        template = Path(str(args["template_path"])).expanduser()
+        if not template.is_absolute():
+            return result(False, "template_path must be an absolute path to an existing .drwdot file.")
+        template = template.resolve()
+        if template.suffix.lower() != ".drwdot" or not template.is_file():
+            return result(False, "template_path must be an absolute path to an existing .drwdot file.")
+        template_path = str(template)
+    scale = {i: float(args[key]) for key, i in (("scale_numerator", 2), ("scale_denominator", 3)) if key in args}
+    if any(not math.isfinite(n) or n <= 0 for n in scale.values()):
+        return result(False, "Drawing scale values must be positive and finite.")
+    if "paper_size" in args and args["paper_size"] not in PAPER_SIZES:
+        return result(False, "Unsupported drawing paper size.")
 
-    if args.get("paper_size") or args.get("first_angle") is not None or args.get("scale_numerator"):
-        sheet = value(doc, "GetCurrentSheet")
-        name = str(safe(sheet, "GetName", "") or "")
-        size = PAPER_SIZES.get(str(args.get("paper_size", "")), int(safe(sheet, "GetSize", 8) or 8))
-        try:
-            doc.SetupSheet5(
-                name, size, 12 if size == 12 else size,
-                float(args.get("scale_numerator", 1)), float(args.get("scale_denominator", 1)),
-                bool(args.get("first_angle", True)), "", 0.0, 0.0, "", True,
+    if template_path is None:
+        created = new_document("drawing")
+        if not created.get("ok"):
+            return created
+    elif running_app().NewDocument(template_path, 0, 0.0, 0.0) is None:
+        return result(False, "SOLIDWORKS did not create a drawing from the specified template.", template_path=template_path)
+    _, doc = require_drawing()
+    payload = {"document": document_info(doc), "sheets": _sheet_names(doc), "template_path": template_path}
+    try:
+        sheet = flag_methods(value(doc, "GetCurrentSheet"), "SetProperties2", "SetScale")
+        properties = list(value(sheet, "GetProperties2"))
+        wanted = properties.copy()
+        for index, number in scale.items():
+            wanted[index] = number
+        if "paper_size" in args:
+            wanted[0] = PAPER_SIZES[args["paper_size"]]
+        if "first_angle" in args:
+            wanted[4] = bool(args["first_angle"])
+        if "paper_size" in args or "first_angle" in args:
+            sheet.SetProperties2(
+                int(wanted[0]), int(wanted[1]), wanted[2], wanted[3], bool(wanted[4]),
+                wanted[5], wanted[6], bool(wanted[7]),
             )
-        except Exception as exc:
-            logger.info("Sheet setup was declined: %s", exc)
-    return result(True, "Created a new drawing.", document=document_info(doc), sheets=_sheet_names(doc))
+        elif scale and not sheet.SetScale(wanted[2], wanted[3], False, False):
+            return result(False, "Created the drawing, but SOLIDWORKS did not set the sheet scale.", partial=True, **payload)
+        actual = list(value(sheet, "GetProperties2"))
+        payload["sheet"] = {
+            "name": str(value(sheet, "GetName")),
+            "paper_size": next((name for name, size in PAPER_SIZES.items() if size == int(actual[0])), str(actual[0])),
+            "sheet_size_mm": [to_mm(actual[5]), to_mm(actual[6])],
+            "scale": [float(actual[2]), float(actual[3])],
+            "first_angle": bool(actual[4]),
+            "sheet_format_path": str(safe(sheet, "GetTemplateName", "") or ""),
+        }
+        if (int(actual[0]) != int(wanted[0]) or bool(actual[4]) != bool(wanted[4])
+                or abs(actual[2] / actual[3] - wanted[2] / wanted[3]) > 1e-9):
+            return result(False, "Created the drawing, but sheet settings differ from the requested values.", partial=True, **payload)
+    except Exception as exc:
+        return result(False, f"Created the drawing, but sheet setup failed: {exc}", partial=True, **payload)
+    payload["document"] = document_info(doc)
+    return result(True, "Created a new drawing.", **payload)
 
 
 def _sheet_names(doc: Any) -> list[str]:
