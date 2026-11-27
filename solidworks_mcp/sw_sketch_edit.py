@@ -202,15 +202,165 @@ def _reject(exc: Exception) -> dict[str, Any]:
                   rollback_performed=False)
 
 
-@tool("inspect_sketch", "Read one named sketch without tree traversal or changing editing context.",
-      {**_SKETCH, "include_segments": {"type": "boolean", "default": False},
+def _inspection_member(entity: Any, member: str) -> Any:
+    try:
+        return value(entity, member)
+    except AttributeError:
+        return None
+
+
+def _drawing_point(point: Any) -> list[float]:
+    coordinates = [float(value(point, axis)) * 1000 for axis in ("X", "Y", "Z")]
+    if not all(math.isfinite(n) for n in coordinates):
+        raise RuntimeError("Non-finite drawing sketch coordinates.")
+    return coordinates
+
+
+def _drawing_identity(entity: Any, app: Any, sketch: Any, name: str) -> dict[str, Any]:
+    if entity is None:
+        return {"type": "unsupported", "scope": "unsupported", "reason": "Null native entity."}
+    ids = as_list(_inspection_member(entity, "GetID"))
+    if len(ids) != 2 or any(isinstance(n, bool) or not isinstance(n, int) for n in ids):
+        return {"type": "unsupported", "scope": "unsupported", "reason": "Entity has no native sketch ID pair."}
+    owner = _inspection_member(entity, "GetSketch")
+    if owner is None:
+        return {"type": "unsupported", "scope": "unsupported", "id": ids, "reason": "Entity has no sketch owner."}
+    local = int(flag_methods(app, "IsSame").IsSame(owner, sketch)) == 1
+    row = {"id": ids, "sketch": name if local else str(value(owner, "Name")),
+           "scope": "view_sketch" if local else "external"}
+    kind = _inspection_member(entity, "GetType")
+    if isinstance(kind, int) and not isinstance(kind, bool):
+        row.update(type=f"segment:{kind}", name=_inspection_member(entity, "GetName"))
+    elif all(_inspection_member(entity, axis) is not None for axis in ("X", "Y", "Z")):
+        row.update(type="point", point_mm=_drawing_point(entity))
+    else:
+        row.update(type="unsupported", reason="Unsupported native sketch entity kind.")
+    return row
+
+
+def _drawing_segments(sketch: Any, describe: Callable[[Any], dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for index, segment in enumerate(as_list(value(sketch, "GetSketchSegments"))):
+        row = describe(segment)
+        if row["scope"] != "view_sketch" or not row["type"].startswith("segment:") or not row.get("name"):
+            raise RuntimeError("Could not identify a drawing-view sketch segment.")
+        row.update(index=index, construction=bool(value(segment, "ConstructionGeometry")))
+        if row["type"] == "segment:0":
+            row.update(start_mm=_drawing_point(value(segment, "GetStartPoint2")),
+                       end_mm=_drawing_point(value(segment, "GetEndPoint2")))
+        else:
+            row["geometry_note"] = "Coordinates are reported for native lines only."
+        rows.append(row)
+    return rows
+
+
+def _drawing_relations(sketch: Any, describe: Callable[[Any], dict[str, Any]],
+                       kinds: set[int] | None) -> list[dict[str, Any]]:
+    manager = flag_methods(value(sketch, "RelationManager"), "GetRelations")
+    rows = []
+    for relation in as_list(manager.GetRelations(0)):
+        kind = int(value(relation, "GetRelationType"))
+        if kinds is not None and kind not in kinds:
+            continue
+        source = "GetDefinitionEntities"
+        entities = as_list(value(relation, source))
+        if not entities:
+            source = "GetEntities"
+            entities = as_list(value(relation, source))
+        descriptions = [describe(entity) for entity in entities]
+        rows.append({"type": kind, "type_name": RELATION_NAMES.get(kind, str(kind)),
+                     "entities_source": source, "entities": descriptions,
+                     "identity_complete": bool(descriptions) and all(e["type"] != "unsupported" for e in descriptions),
+                     "relation_ref": None, "inspection_only": True})
+    return rows
+
+
+def _drawing_dimensions(view: Any, name: str, describe: Callable[[Any], dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    rows = []
+    other_count = 0
+    seen = set()
+    display = value(view, "GetFirstDisplayDimension")
+    while display is not None:
+        dimension = flag_methods(display, "GetDimension2").GetDimension2(0)
+        full_name = str(value(dimension, "FullName"))
+        if full_name in seen:
+            raise RuntimeError("Repeated dimension during drawing-view inspection; enumeration is incomplete.")
+        seen.add(full_name)
+        if full_name.split("@")[1:2] != [name]:
+            other_count += 1
+        else:
+            kind = int(value(dimension, "GetType"))
+            driven = int(value(dimension, "DrivenState"))
+            system_value = float(value(dimension, "SystemValue"))
+            if not math.isfinite(system_value):
+                raise RuntimeError("Non-finite drawing dimension value.")
+            annotation = value(display, "GetAnnotation")
+            entities = as_list(value(annotation, "GetAttachedEntities3"))
+            attachments = [describe(entity) for entity in entities]
+            row = {"full_name": full_name, "kind": {0: "linear", 1: "angular"}.get(kind, "unsupported"),
+                   "driven": driven == 1, "driving": driven == 2, "driven_state": driven,
+                   "system_value": system_value, "attachments": attachments,
+                   "attachments_complete": bool(attachments) and all(e["type"] != "unsupported" for e in attachments)}
+            if kind == 0:
+                row.update(value_mm=system_value * 1000, unit="mm")
+            elif kind == 1:
+                row.update(value_deg=math.degrees(system_value), unit="deg")
+            else:
+                row["unit"] = "native"
+            rows.append(row)
+        display = value(display, "GetNext")
+    return rows, other_count
+
+
+def _inspect_drawing_sketch(app: Any, doc: Any, args: dict[str, Any]) -> dict[str, Any]:
+    from .sw_drawing_geometry import find_view
+
+    if int(value(doc, "GetType")) != 3:
+        raise ValueError("view_name requires a drawing document.")
+    if args.get("include_equations", False):
+        raise ValueError("Drawing-view equation inspection is unsupported; inspect the referenced model separately.")
+    view_name = _name(args.get("view_name"), "view_name")
+    view = find_view(doc, view_name)
+    sketch = value(view, "GetSketch")
+    if sketch is None:
+        raise ValueError("The drawing view has no sketch.")
+    name = str(value(sketch, "Name"))
+    if "sketch_name" in args and _name(args["sketch_name"], "sketch_name") != name:
+        raise ValueError("sketch_name does not match the named drawing view's sketch.")
+    path = str(value(doc, "GetPathName") or "")
+    data = {"document_key": document_path_key(path) if path else "untitled:" + str(value(doc, "GetTitle")),
+            "document_type": "drawing", "view_name": view_name, "sketch": name,
+            "configuration": str(value(view, "ReferencedConfiguration")),
+            "referenced_model_path": str(value(view, "GetReferencedModelName")),
+            "coordinate_space": "view_sketch", "coordinate_units": "mm",
+            "dimensions_scope": "embedded_view_sketch", "relation_refs_available": False,
+            **_editing_state(doc), "native_sketch_status": int(value(sketch, "GetConstrainedStatus"))}
+    active = doc.SketchManager.ActiveSketch
+    data["target_is_active_sketch"] = active is not None and int(flag_methods(app, "IsSame").IsSame(active, sketch)) == 1
+    describe = lambda entity: _drawing_identity(entity, app, sketch, name)
+    if args.get("include_segments", False):
+        data["segments"] = _drawing_segments(sketch, describe)
+    if args.get("include_relations", True):
+        kinds = args.get("relation_types")
+        selected = None if kinds is None else {RELATIONS[k] if isinstance(k, str) else int(k) for k in kinds}
+        data["relations"] = _drawing_relations(sketch, describe, selected)
+    if args.get("include_dimensions", True):
+        data["dimensions"], data["other_view_dimension_count"] = _drawing_dimensions(view, name, describe)
+    return result(True, "Read drawing-view sketch state without changing editing context.", **data)
+
+
+@tool("inspect_sketch", "Read one named model sketch or drawing view without changing selection or editing context. "
+      "For drawings pass view_name; sketch_name is an optional matching guard. Drawing equations are not inspected.",
+      {**_SKETCH, "view_name": _NAME, "include_segments": {"type": "boolean", "default": False},
        "include_relations": {"type": "boolean", "default": True},
        "relation_types": {"type": "array", "items": {"type": ["integer", "string"]}},
        "include_dimensions": {"type": "boolean", "default": True},
-       "include_equations": {"type": "boolean", "default": True}}, list(_SKETCH))
+       "include_equations": {"type": "boolean", "description": "Default true for model sketches; false for drawings. Explicit true is unsupported for drawing views."}}, list(_BASE))
 def inspect_sketch(args: dict[str, Any]) -> dict[str, Any]:
     try:
         app, doc = _doc(args)
+        if "view_name" in args:
+            return _inspect_drawing_sketch(app, doc, args)
         name, feature, sketch = _sketch(doc, args.get("sketch_name"))
         data = {**_context(doc, name), **_editing_state(doc),
                 "native_sketch_status": int(value(sketch, "GetConstrainedStatus"))}

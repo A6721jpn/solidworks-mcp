@@ -12,6 +12,8 @@ Read `status --context C`. Complete atomic coverage with `finish`; that receipt 
 
 Use `operation-note` for opaque direct API/CLI operations, recording the atomic operation, route, result and known measurements. Use `fallback-note` for unrecognized UI activity, including opaque bindings and unsupported node-repl routes. Do not copy whole transcripts. Replaying an observation must not duplicate it.
 
+Record start/end times or monotonic elapsed duration for named direct API/CLI steps as they run. Preserve the process's total duration across yielded sessions; one `exec_command.wall_time_seconds` chunk is not the whole process duration.
+
 Assess both:
 
 - Capabilities: existing-function oversight, stale connection, bug, reusable missing operation or one-time diagnostic.
@@ -26,6 +28,10 @@ Call `propose --context C --proposal FILE` with `capability_assessment`, `effici
 If no improvement is worthwhile, submit an empty list and `no_candidate_reason`. Do not invent candidates.
 
 Display IDs and meanings unchanged in a short Japanese list/table at the end of the CAD response. Explain what becomes possible, expected time/response-volume reduction and how it will be checked. Distinguish estimates from measured savings. The user may choose numbers, names, all or none; keep implementation details in artifacts.
+
+Every candidate must also show **time spent on that operation in this CAD job**, calculated from the relevant logs. Include the baseline in its evidence and displayed list. Keep a local timing artifact with the proposal/candidate IDs, log references, call or operation IDs, intervals, units and calculation. Count failed attempts and retries. Sum execution durations only when presenting cumulative execution time; merge overlapping intervals when presenting elapsed time. Identify shared intervals rather than adding the same time to an overall total twice.
+
+Label the measurement: MCP processing time, process runtime, or execution-start to completion-observation elapsed time. The last includes waits and any delay before polling, so it is not pure process runtime. State excluded preparation or unmeasured intervals. Missing timing is never zero: show the measured subtotal plus what is unknown, or say timing is unavailable and why. Do not substitute the whole chat duration for the candidate's operation, infer duration from prose, or present this baseline as time already saved. Historical immutable proposals stay unchanged; attach a timing supplement instead.
 
 Wait for the answer. Candidate creation, tickets, past blanket permission, silence and generated continuation prompts do not authorize implementation. Additional discoveries remain separate from selected scope.
 

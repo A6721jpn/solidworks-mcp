@@ -161,6 +161,10 @@ Editing: `sketch_fillet`, `sketch_chamfer`, `sketch_trim`, `sketch_offset`,
 
 Parametrics: `add_relation`, `add_dimension`, `set_dimension`, `list_dimensions`.
 
+`convert_entities` can synchronize a projected sketch with its source profile.
+It preserves protected contours, adds missing projections, and marks obsolete
+projections as construction geometry. See [projected sketch synchronization](PROFILE-SYNC.md).
+
 ### Features
 `boss_extrude`, `cut_extrude`, `revolve`, `fillet`, `chamfer`, `shell`, `draft`,
 `rib`, `simple_hole`, `sweep`, `loft`, `linear_pattern`, `circular_pattern`,
