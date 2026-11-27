@@ -5,6 +5,7 @@ Source drawings must already be open and are never activated or edited.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -111,8 +112,7 @@ def _note_asset(note: Any, sheet: str, view: str) -> NoteAsset:
     return NoteAsset(note, annotation, snapshot, formats)
 
 
-def _notes(doc: Any, sheet_name: str | None = None, note_names: set[str] | None = None) -> list[NoteAsset]:
-    assets = []
+def _iter_notes(doc: Any, sheet_name: str | None = None) -> Iterator[tuple[Any, str, str]]:
     for group in as_list(value(doc, "GetViews")):
         views = [dynamic.Dispatch(v) if isinstance(v, dynamic.PyIDispatchType) else v
                  for v in as_list(group)]
@@ -124,11 +124,30 @@ def _notes(doc: Any, sheet_name: str | None = None, note_names: set[str] | None 
         for view in views:
             view_name = str(value(view, "GetName2") or "")
             for note in as_list(value(view, "GetNotes")):
-                if (note_names is not None
-                        and str(value(value(note, "GetAnnotation"), "GetName")) not in note_names):
-                    continue
-                assets.append(_note_asset(note, name, view_name))
-    return assets
+                yield note, name, view_name
+
+
+def _notes(doc: Any, sheet_name: str | None = None, note_names: set[str] | None = None) -> list[NoteAsset]:
+    return [_note_asset(note, sheet, view) for note, sheet, view in _iter_notes(doc, sheet_name)
+            if note_names is None or str(value(value(note, "GetAnnotation"), "GetName")) in note_names]
+
+
+def _inspect_named_notes(doc: Any, note_names: set[str]) -> dict[str, Any]:
+    notes = []
+    for note, sheet, view in _iter_notes(doc):
+        annotation = value(note, "GetAnnotation")
+        name = str(value(annotation, "GetName") or "")
+        if name not in note_names:
+            continue
+        unsupported: list[str] = []
+        notes.append({"name": name, "sheet": sheet, "view": view,
+                      "text": str(value(note, "GetText") or ""),
+                      "raw_text": _optional(note, "PropertyLinkedText", unsupported, "raw_text"),
+                      "owner_type": _optional(annotation, "OwnerType", unsupported, "owner_type"),
+                      "unsupported_fields": unsupported})
+    return result(True, "Read displayed text and property links for the requested note names.", notes=notes,
+                  title_fields=[note for note in notes if note["owner_type"] == 2],
+                  missing_note_names=sorted(note_names - {note["name"] for note in notes}))
 
 
 def _current_sheet(doc: Any) -> tuple[Any, str]:
@@ -295,10 +314,18 @@ def _raw_cell_put(table: Any, row: int, column: int, text: str) -> None:
 _PATH_PROPERTY = {"type": "string", "description": "Active drawing document_key (saved path or untitled:<exact title>)."}
 
 
-@tool("inspect_drawing_assets", "Read exact note names, linked text, title fields, and native revision table metadata. No saves.",
-      {"expected_document_path": _PATH_PROPERTY}, ["expected_document_path"])
+@tool("inspect_drawing_assets", "Read notes, title fields and native revision tables. With note_names, read only the displayed text and property links for exact note names. No saves.",
+      {"expected_document_path": _PATH_PROPERTY,
+       "note_names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1},
+                      "description": "Exact annotation names to match, across sheets and views."}},
+      ["expected_document_path"])
 def inspect_drawing_assets(args: dict[str, Any]) -> dict[str, Any]:
     _, doc = require_document_path(args["expected_document_path"], 3)
+    if "note_names" in args:
+        names = args["note_names"]
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("note_names must be a nonempty array of exact annotation names.")
+        return _inspect_named_notes(doc, set(names))
     notes = _notes(doc)
     tables = []
     sheets = []

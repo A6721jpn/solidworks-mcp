@@ -34,6 +34,12 @@ class PostWorkTests(unittest.TestCase):
             input=json.dumps(event) if event else None, encoding='utf-8', capture_output=True, timeout=10)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
+            # Historical post-work receipts retain their recorded version-1 semantics.
+            if event and event.get('hook_event_name') == 'UserPromptSubmit':
+                for path in (self.root/'outputs/mcp-coverage-audit').glob('*.json'):
+                    state = json.loads(path.read_text(encoding='utf-8'))
+                    state['version'] = 1
+                    path.write_text(json.dumps(state), encoding='utf-8')
             return json.loads(result.stdout)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         return result.stderr

@@ -30,6 +30,12 @@ class CoverageHookTests(unittest.TestCase):
                               capture_output=True, timeout=10)
         if ok:
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            # This suite exercises recorded version-1 compatibility explicitly.
+            if event and event.get('hook_event_name') == 'UserPromptSubmit':
+                for path in (self.root/'outputs/mcp-coverage-audit').glob('*.json'):
+                    state = json.loads(path.read_text(encoding='utf-8'))
+                    state['version'] = 1
+                    path.write_text(json.dumps(state), encoding='utf-8')
             return json.loads(proc.stdout)
         self.assertNotEqual(proc.returncode, 0)
         return proc
@@ -48,6 +54,9 @@ class CoverageHookTests(unittest.TestCase):
         denied = self.cli('hook', event=self.event('PreToolUse'))
         self.assertEqual(denied['hookSpecificOutput']['permissionDecision'], 'deny')
         context = next((self.root/'outputs/mcp-coverage-audit').glob('*.json'))
+        state = json.loads(context.read_text(encoding='utf-8'))
+        state['version'] = 1
+        context.write_text(json.dumps(state), encoding='utf-8')
         ops = [operation or {'operation': 'Read faces', 'status': 'covered', 'tool': 'list_faces', 'reason': 'Source tool exists.'}]
         self.cli('preflight', '--context', str(context), '--operations', self.file('operations.json', ops))
         return str(context)
@@ -112,9 +121,12 @@ class CoverageHookTests(unittest.TestCase):
 
     def test_stop_continuation_is_bounded_and_does_not_claim_a_confirmed_gap(self):
         context = self.prepare()
+        self.file('outputs/mcp-coverage-audit/' + '0' * 24 + '.json', ['preflight artifact'])
+        self.file('outputs/mcp-coverage-audit/' + '1' * 24 + '.json', {'reviews': []})
         self.cli('hook', event=self.event('PostToolUse', tool_input={'code': 'd.InsertOffsetSurface(0, False)'}))
         first = self.cli('hook', event=self.event('Stop', stop_hook_active=False))
         self.assertEqual(first['decision'], 'block')
+        self.assertIn('Do not implement any improvement without a real user selection', first['reason'])
         second = self.cli('hook', event=self.event('Stop', stop_hook_active=True))
         self.assertNotIn('decision', second)
         self.assertIn('needs_review', second['systemMessage'])

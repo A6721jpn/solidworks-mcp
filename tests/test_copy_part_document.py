@@ -39,7 +39,7 @@ class CopyPartTests(unittest.TestCase):
             target=Path(folder)/'copy.SLDPRT'
             target.touch()
             with patch.object(sw_file,'require_document_path',return_value=(None,object())), \
-                 patch.object(sw_file,'OUTPUT_ROOT',Path(folder)), \
+                 patch.object(sw_file,'OUTPUT_ROOT',Path(folder).resolve()), \
                  patch.object(sw_file,'extension') as extension:
                 with self.assertRaisesRegex(RuntimeError,'overwrite'):
                     sw_file.copy_part_document({'expected_document_path':'source','path':str(target)})
