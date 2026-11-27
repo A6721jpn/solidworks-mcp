@@ -114,7 +114,7 @@ INSTRUCTIONS = (
 # Tools whose result gets no auto-diff: they do not change geometry, or they
 # already report the change themselves.
 READ_ONLY_TOOLS = {
-    "solidworks_status", "get_active_document_info", "create_new_document", "open_document",
+    "solidworks_status", "get_active_document_info", "inspect_document_references", "create_new_document", "open_document",
     "save_document", "save_active_document", "export_document", "rebuild_document",
     "list_components", "list_mates", "list_sheets", "list_drawing_views", "activate_sheet",
     "activate_drawing_view", "list_faces", "list_edges", "list_vertices", "list_bodies",

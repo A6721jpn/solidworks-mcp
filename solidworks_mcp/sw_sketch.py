@@ -22,6 +22,7 @@ afterthought.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .sw_core import (
@@ -43,6 +44,7 @@ from .sw_core import (
     logger,
     rebuild,
     require_part,
+    require_document_path,
     require_selection,
     resolve_plane_name,
     resolve_sketch,
@@ -221,27 +223,88 @@ def list_sketch_segments(args: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 _XY = {"x_mm": {"type": "number"}, "y_mm": {"type": "number"}}
+_LINE_COORDINATES = ("x1_mm", "y1_mm", "x2_mm", "y2_mm")
+_LINE_PROPERTIES = {
+    **{name: {"type": "number"} for name in _LINE_COORDINATES},
+    "construction": {"type": "boolean", "default": False},
+}
+
+
+def _line_coordinates(line: dict[str, Any]) -> tuple[float, ...]:
+    x1, y1, x2, y2 = (to_m(line[name]) for name in _LINE_COORDINATES)
+    return x1, y1, 0.0, x2, y2, 0.0
+
+
+def _create_line(manager: Any, coordinates: tuple[float, ...], construction: bool) -> Any:
+    segment = manager.CreateLine(*coordinates)
+    if segment is not None and construction:
+        segment.ConstructionGeometry = True
+    return segment
+
+
+def _draw_line_batch(args: dict[str, Any]) -> dict[str, Any]:
+    lines = args["lines"]
+    if not isinstance(lines, list) or not lines or any(name in args for name in _LINE_PROPERTIES):
+        raise ValueError("Provide a nonempty lines array instead of top-level line coordinates or construction.")
+    prepared = []
+    for index, line in enumerate(lines, start=1):
+        coordinates = _line_coordinates(line)
+        if not all(math.isfinite(n) for n in coordinates) or coordinates[:3] == coordinates[3:]:
+            raise ValueError(f"Line {index} needs finite coordinates and distinct endpoints.")
+        prepared.append((coordinates, bool(line.get("construction", False))))
+
+    _, doc = require_document_path(args["expected_document_path"], 3)
+    sketch = _active_sketch(doc)
+    manager = sketch_manager(doc)
+    before = len(as_list(value(sketch, "GetSketchSegments")))
+    completed = 0
+    failure = None
+    inference_mode = manager.InferenceMode
+    try:
+        manager.InferenceMode = False
+        for coordinates, construction in prepared:
+            try:
+                if _create_line(manager, coordinates, construction) is None:
+                    raise RuntimeError("SOLIDWORKS did not return a line.")
+            except Exception as exc:
+                failure = str(exc)
+                break
+            completed += 1
+    finally:
+        manager.InferenceMode = inference_mode
+
+    try:
+        added = len(as_list(value(sketch, "GetSketchSegments"))) - before
+    except Exception as exc:
+        return result(False, f"Could not verify the sketch count: {exc}", completed_lines=completed,
+                      may_have_changes=True)
+    if failure is not None:
+        return result(False, f"Stopped at line {completed + 1}: {failure}", segments_added=added,
+                      completed_lines=completed, failed_line=completed + 1, may_have_changes=True)
+    if added != len(prepared):
+        return result(False, "The sketch count does not match the requested batch.", segments_added=added,
+                      completed_lines=completed, may_have_changes=True)
+    return result(True, f"Added {added} lines.", segments_added=added)
 
 
 @tool(
     "draw_line",
-    "Add a line to the open sketch. Coordinates are millimetres in sketch space.",
+    "Add a line to the open sketch, or add multiple lines to the open sketch in a guarded drawing. "
+    "Coordinates are millimetres in sketch space. Batch endpoints are placed without automatic snapping. "
+    "For a single line, provide all four top-level coordinates.",
     {
-        "x1_mm": {"type": "number"}, "y1_mm": {"type": "number"},
-        "x2_mm": {"type": "number"}, "y2_mm": {"type": "number"},
-        "construction": {"type": "boolean", "default": False},
+        **_LINE_PROPERTIES,
+        "expected_document_path": {"type": "string", "description": "Active drawing document_key, required for lines."},
+        "lines": {"type": "array", "minItems": 1, "description": "Drawing-only batch. Each item is one line.",
+                  "items": {"type": "object", "properties": _LINE_PROPERTIES, "required": list(_LINE_COORDINATES)}},
     },
-    ["x1_mm", "y1_mm", "x2_mm", "y2_mm"],
 )
 def draw_line(args: dict[str, Any]) -> dict[str, Any]:
+    if "lines" in args:
+        return _draw_line_batch(args)
     doc, manager = _require_open_sketch()
     before = _segment_count(doc)
-    segment = manager.CreateLine(
-        to_m(args["x1_mm"]), to_m(args["y1_mm"]), 0.0,
-        to_m(args["x2_mm"]), to_m(args["y2_mm"]), 0.0,
-    )
-    if segment is not None and bool(args.get("construction", False)):
-        segment.ConstructionGeometry = True
+    _create_line(manager, _line_coordinates(args), bool(args.get("construction", False)))
     return _drawn(doc, before, "a line")
 
 
