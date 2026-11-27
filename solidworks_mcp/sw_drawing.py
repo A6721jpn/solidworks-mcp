@@ -29,6 +29,7 @@ Sheet coordinates are millimetres from the lower-left corner of the sheet.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ from .sw_core import (
     result,
     running_app,
     safe,
+    select_object,
     sketch_manager,
     to_m,
     to_mm,
@@ -551,6 +553,33 @@ def _draw_in_view(doc: Any, parent_view: str | None, draw: Any) -> tuple[str, An
     return name, entity
 
 
+def _section_sketch_point(view: Any, x_mm: float, y_mm: float) -> tuple[float, float, float]:
+    transform = list(value(value(view, "ModelToViewTransform"), "ArrayData"))
+    if len(transform) < 13:
+        raise RuntimeError("Missing drawing view transform for the cutting line.")
+    origin_x, origin_y, scale = (float(transform[i]) for i in (9, 10, 12))
+    angle = float(value(view, "Angle"))
+    x, y = to_m(x_mm), to_m(y_mm)
+    if not all(math.isfinite(n) for n in (origin_x, origin_y, scale, angle, x, y)) or scale <= 0:
+        raise RuntimeError("The cutting line needs finite coordinates and a positive view scale.")
+    dx, dy = (x - origin_x) / scale, (y - origin_y) / scale
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return cosine * dx + sine * dy, -sine * dx + cosine * dy, 0.0
+
+
+def _section_failure(doc: Any, line: Any, parent: str | None, message: str) -> dict[str, Any]:
+    removed = False
+    try:
+        clear_selection(doc)
+        if select_object(doc, line, mark=0, append=False):
+            removed = bool(extension(doc).DeleteSelection2(0))
+        clear_selection(doc)
+    except Exception:
+        pass
+    return result(False, message, parent=parent, generated_line_removed=removed,
+                  partial=not removed, rollback_performed=False)
+
+
 @tool(
     "insert_section_view",
     "Create a section view: give the cutting line's two endpoints and where the section should "
@@ -576,31 +605,47 @@ def insert_section_view(args: dict[str, Any]) -> dict[str, Any]:
 
     _, doc = require_drawing()
     parent = args.get("parent_view")
-    if not bool(args.get("use_selection", False)):
-        for key in ("x1_mm", "y1_mm", "x2_mm", "y2_mm"):
-            if args.get(key) is None:
-                return result(False, f"Pass the cutting line endpoints, or set use_selection. Missing {key}.")
-        parent, _ = _draw_in_view(
-            doc, parent,
-            lambda sm: sm.CreateLine(
-                to_m(args["x1_mm"]), to_m(args["y1_mm"]), 0.0,
-                to_m(args["x2_mm"]), to_m(args["y2_mm"]), 0.0,
-            ),
-        )
+    generated_line = None
+    try:
+        if not bool(args.get("use_selection", False)):
+            for key in ("x1_mm", "y1_mm", "x2_mm", "y2_mm"):
+                if args.get(key) is None:
+                    return result(False, f"Pass the cutting line endpoints, or set use_selection. Missing {key}.")
+            parents = [v for v in _iter_views(doc) if int(safe(v, "Type", 1) or 1) != 1
+                       and (not parent or str(safe(v, "GetName2", "")) == str(parent))]
+            if not parents:
+                raise RuntimeError("No parent drawing view. Place a view before sectioning it.")
+            parent_view = parents[0] if parent else parents[-1]
+            start = _section_sketch_point(parent_view, args["x1_mm"], args["y1_mm"])
+            end = _section_sketch_point(parent_view, args["x2_mm"], args["y2_mm"])
+            parent = str(value(parent_view, "GetName2"))
+            if not bool(doc.ActivateView(parent)):
+                raise RuntimeError(f"Could not activate view '{parent}'.")
+            generated_line = sketch_manager(doc).CreateLine(*start, *end)
+            if generated_line is None:
+                raise RuntimeError("SOLIDWORKS did not draw the cutting line in the view.")
+            clear_selection(doc)
+            if not select_object(doc, generated_line, mark=0, append=False):
+                raise RuntimeError("Could not select the cutting line just drawn.")
 
-    # swCreateSectionViewAtOptions_e: 1 = section, 2 = exclude fasteners.
-    options = 1 | (2 if bool(args.get("exclude_fasteners", False)) else 0)
-    view = doc.CreateSectionViewAt5(
-        to_m(args["place_x_mm"]), to_m(args["place_y_mm"]), 0.0,
-        str(args.get("label", "A")), options, empty_variant(),
-        to_m(args.get("depth_mm", 0)),
-    )
+        # swCreateSectionViewAtOptions_e: 1 = section, 2 = exclude fasteners.
+        options = 1 | (2 if bool(args.get("exclude_fasteners", False)) else 0)
+        view = doc.CreateSectionViewAt5(
+            to_m(args["place_x_mm"]), to_m(args["place_y_mm"]), 0.0,
+            str(args.get("label", "A")), options, empty_variant(),
+            to_m(args.get("depth_mm", 0)),
+        )
+    except Exception as exc:
+        if generated_line is None:
+            raise
+        return _section_failure(doc, generated_line, parent, str(exc))
     if view is None:
+        message = ("SOLIDWORKS did not create the section view. Check that the cutting line actually "
+                   "crosses the parent view's geometry.")
+        if generated_line is not None:
+            return _section_failure(doc, generated_line, parent, message)
         return result(
-            False,
-            "SOLIDWORKS did not create the section view. Check that the cutting line actually "
-            "crosses the parent view's geometry.",
-            parent=parent,
+            False, message, parent=parent,
         )
     rebuild(doc)
     return result(

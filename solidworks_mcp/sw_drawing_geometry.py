@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -170,72 +171,221 @@ def _delete_dimension(doc: Any, dim: Any) -> bool:
     return bool(ext.SelectByID2(name, "DIMENSION", 0, 0, 0, False, 0, nothing(), 0) and ext.DeleteSelection2(0))
 
 
-@tool("add_drawing_dimension", "Add one associative reference dimension to visible geometry in a named view. Refuse ambiguous selectors, stale configuration, duplicate names, or a measured value that differs from expected_value_mm. Never change the part dimensions.",
-      {"expected_document_path": EXPECTED, "view_name": {"type": "string"},
-       "configuration": {"type": "string"}, "name": {"type": "string"},
-       "kind": {"type": "string", "enum": list(_DIMENSION_METHODS)},
-       "entities": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "object"}},
-       "at_mm": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
-       "expected_value_mm": {"type": "number"}, "tolerance_mm": {"type": "number", "default": 0.00001},
-       "prefix": {"type": "string", "default": ""}, "precision": {"type": "integer", "minimum": 0, "maximum": 8}},
-      ["expected_document_path", "view_name", "configuration", "name", "kind", "entities", "at_mm", "expected_value_mm"])
-def add_drawing_dimension(args: dict[str, Any]) -> dict[str, Any]:
-    app, doc = drawing(args)
-    view = find_view(doc, str(args["view_name"]))
-    config = str(value(view, "ReferencedConfiguration"))
-    if config != str(args["configuration"]):
-        raise RuntimeError(f"View configuration changed: expected '{args['configuration']}', got '{config}'.")
-    name = str(args["name"])
+_DIMENSION_FIELDS = {
+    "view_name": {"type": "string"}, "configuration": {"type": "string"},
+    "name": {"type": "string"}, "kind": {"type": "string", "enum": list(_DIMENSION_METHODS)},
+    "entities": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "object"}},
+    "at_mm": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
+    "expected_value_mm": {"type": "number"}, "tolerance_mm": {"type": "number", "default": 0.00001},
+    "prefix": {"type": "string", "default": ""},
+    "precision": {"type": "integer", "minimum": 0, "maximum": 8},
+}
+_DIMENSION_REQUIRED = ["view_name", "configuration", "name", "kind", "entities", "at_mm", "expected_value_mm"]
+
+
+@dataclass(frozen=True)
+class _ViewContext:
+    view: Any
+    configuration: str
+    rows: list[tuple[dict[str, Any], Any]]
+    names: set[str]
+
+
+@dataclass(frozen=True)
+class _PreparedDimension:
+    view_name: str
+    configuration: str
+    name: str
+    view: Any
+    entities: list[Any]
+    method: str
+    at: list[float]
+    expected: float
+    tolerance: float
+    prefix: str
+    precision: int | None
+
+
+class _DimensionConflict(RuntimeError):
+    pass
+
+
+def _dimension_requests(args: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    batch = "dimensions" in args
+    if not batch:
+        return [args], False
+    if any(key in args for key in _DIMENSION_FIELDS):
+        raise RuntimeError("Pass dimensions or single-dimension fields, not both.")
+    requests = args["dimensions"]
+    if not isinstance(requests, list) or not 1 <= len(requests) <= 64:
+        raise RuntimeError("dimensions must contain 1-64 dimension requests.")
+    for item in requests:
+        if not isinstance(item, dict) or set(item) - set(_DIMENSION_FIELDS):
+            raise RuntimeError("Each dimension request must contain only dimension fields.")
+    return requests, True
+
+
+def _prepare_dimension(doc: Any, raw: dict[str, Any], contexts: dict[str, _ViewContext]) -> _PreparedDimension:
+    missing = set(_DIMENSION_REQUIRED) - set(raw)
+    if missing:
+        raise RuntimeError(f"Missing dimension fields: {', '.join(sorted(missing))}.")
+    name = str(raw["name"])
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name):
         raise RuntimeError("Dimension name must be 1-64 ASCII letters, digits, or underscores, beginning with a letter.")
-    for existing in dimensions(view):
-        if str(safe(existing.GetDimension2(0), "Name", "")).split('@')[0] == name:
-            return result(False, f"Dimension '{name}' already exists. Inspect or update it explicitly; no duplicate created.", conflict=True)
-    expected = finite(args["expected_value_mm"], "expected_value_mm", True)
-    tolerance = finite(args.get("tolerance_mm", .00001), "tolerance_mm", True)
-    at = point(args["at_mm"], 2, "at_mm")
-    selectors = args["entities"]
-    if not isinstance(selectors, list) or not 1 <= len(selectors) <= 2:
-        raise RuntimeError("Select one or two entities.")
-    kind = str(args["kind"])
+    expected = finite(raw["expected_value_mm"], "expected_value_mm", True)
+    tolerance = finite(raw.get("tolerance_mm", .00001), "tolerance_mm", True)
+    at = point(raw["at_mm"], 2, "at_mm")
+    selectors = raw["entities"]
+    if not isinstance(selectors, list) or not 1 <= len(selectors) <= 2 or not all(isinstance(s, dict) for s in selectors):
+        raise RuntimeError("Select one or two geometry selectors.")
+    kind = str(raw["kind"])
     if kind not in _DIMENSION_METHODS:
         raise RuntimeError("Unknown dimension kind.")
-    precision = args.get("precision")
+    precision = raw.get("precision")
     if precision is not None and (isinstance(precision, bool) or int(precision) != precision or not 0 <= int(precision) <= 8):
         raise RuntimeError("precision must be an integer from 0 to 8.")
-    rows = catalog(view)
-    resolved = [resolve_entity(rows, s, tolerance) for s in selectors]
+    view_name = str(raw["view_name"])
+    if view_name not in contexts:
+        view = find_view(doc, view_name)
+        contexts[view_name] = _ViewContext(
+            view, str(value(view, "ReferencedConfiguration")), catalog(view),
+            {str(safe(d.GetDimension2(0), "Name", "")).split('@')[0] for d in dimensions(view)},
+        )
+    context = contexts[view_name]
+    config = str(raw["configuration"])
+    if config != context.configuration:
+        raise RuntimeError(f"View configuration changed: expected '{config}', got '{context.configuration}'.")
+    if name in context.names:
+        raise _DimensionConflict(f"Dimension '{name}' already exists. Inspect or update it explicitly; no duplicate created.")
+    resolved = [resolve_entity(context.rows, selector, tolerance) for selector in selectors]
+    context.names.add(name)
     method = _DIMENSION_METHODS[kind]
     flag_methods(doc, method)
-    clear_selection(doc)
+    return _PreparedDimension(view_name, config, name, context.view, resolved, method, at,
+                              expected, tolerance, str(raw.get("prefix", "")),
+                              int(precision) if precision is not None else None)
+
+
+@tool("add_drawing_dimension", "Add one associative reference dimension, or a dimensions batch of 1-64 requests, to visible drawing geometry. Validate the entire batch before changes, share geometry per view and rebuild once. Refuse ambiguous selectors, stale configuration, duplicate names or unexpected measured values. Native failures report partial changes; never change part dimensions.",
+      {"expected_document_path": EXPECTED, **_DIMENSION_FIELDS,
+       "dimensions": {"type": "array", "minItems": 1, "maxItems": 64,
+                      "items": {"type": "object", "properties": _DIMENSION_FIELDS,
+                                "required": _DIMENSION_REQUIRED, "additionalProperties": False}}},
+      ["expected_document_path"])
+def add_drawing_dimension(args: dict[str, Any]) -> dict[str, Any]:
+    batch = "dimensions" in args
     try:
-        for i, entity in enumerate(resolved):
-            if not view.SelectEntity(entity, i > 0):
-                raise RuntimeError("Could not select the dimension geometry in its drawing view.")
+        requests, batch = _dimension_requests(args)
+        app, doc = drawing(args)
+        contexts: dict[str, _ViewContext] = {}
+        prepared = [_prepare_dimension(doc, item, contexts) for item in requests]
+    except Exception as exc:
+        if not batch and not isinstance(exc, _DimensionConflict):
+            raise
+        return result(False, str(exc), changed=False, conflict=isinstance(exc, _DimensionConflict), stage="preflight")
+
+    created: list[dict[str, Any]] = []
+    failure: dict[str, Any] | None = None
+    mutated = False
+    rebuild_ok = None
+    index = 0
+    try:
         with dimension_dialog_suppressed(app):
-            display = getattr(doc, method)(to_m(at[0]), to_m(at[1]), 0.0)
-        if display is None:
-            raise RuntimeError("SolidWorks did not create the drawing dimension.")
-        flag_methods(display, "GetDimension2", "GetText", "SetText", "SetPrecision3")
-        param = display.GetDimension2(0)
-        measured = to_mm(value(param, "SystemValue"))
-        if abs(measured-expected) > tolerance:
-            removed = _delete_dimension(doc, display)
-            return result(False, f"Measured {measured:g} mm, expected {expected:g} mm.",
-                          measured_mm=measured, removed=removed,
-                          created_dimension=str(safe(param, "FullName", "")))
-        param.Name = name
-        symbol = str(display.GetText(1) or "")
-        display.SetText(1, str(args.get("prefix", "")) + symbol)
-        if precision is not None and display.SetPrecision3(int(precision), int(precision), int(precision), int(precision)) != 0:
-            raise RuntimeError("Dimension created, but precision could not be set.")
-        rebuild(doc)
-        if str(value(param, "Name")).split('@')[0] != name:
-            raise RuntimeError("Dimension created, but its requested name did not persist.")
-        return result(True, "Created measured drawing dimension.", dimension=str(value(param, "FullName")),
-                      measured_mm=to_mm(value(param, "SystemValue")), prefix=display.GetText(1))
+            for index, item in enumerate(prepared):
+                try:
+                    require_document_path(str(args["expected_document_path"]), 3)
+                    if str(value(item.view, "ReferencedConfiguration")) != item.configuration:
+                        raise RuntimeError("View configuration changed after preflight.")
+                    clear_selection(doc)
+                    for i, entity in enumerate(item.entities):
+                        if not item.view.SelectEntity(entity, i > 0):
+                            raise RuntimeError("Could not select the dimension geometry in its drawing view.")
+                    display = getattr(doc, item.method)(to_m(item.at[0]), to_m(item.at[1]), 0.0)
+                    if display is None:
+                        raise RuntimeError("SolidWorks did not create the drawing dimension.")
+                    mutated = True
+                    entry = {"index": index, "view_name": item.view_name, "name": item.name,
+                             "dimension": None, "measured_mm": None, "status": "created"}
+                    created.append(entry)
+                    flag_methods(display, "GetDimension2", "GetText", "SetText", "SetPrecision3")
+                    param = display.GetDimension2(0)
+                    measured = to_mm(value(param, "SystemValue"))
+                    entry.update(dimension=str(value(param, "FullName")), measured_mm=measured)
+                    if not math.isfinite(measured) or abs(measured-item.expected) > item.tolerance:
+                        require_document_path(str(args["expected_document_path"]), 3)
+                        failure = {"index": index, "name": item.name, "view_name": item.view_name,
+                                   "message": f"Measured {measured:g} mm, expected {item.expected:g} mm.",
+                                   "measured_mm": measured, "removed": None,
+                                   "created_dimension": entry["dimension"]}
+                        try:
+                            failure["removed"] = _delete_dimension(doc, display)
+                        except Exception as exc:
+                            failure["cleanup_error"] = str(exc)
+                        if failure["removed"]:
+                            created.pop()
+                        break
+                    param.Name = item.name
+                    symbol = str(display.GetText(1) or "")
+                    display.SetText(1, item.prefix + symbol)
+                    if display.GetText(1) != item.prefix + symbol:
+                        raise RuntimeError("Dimension created, but its prefix could not be set.")
+                    if item.precision is not None and display.SetPrecision3(item.precision, item.precision, item.precision, item.precision) != 0:
+                        raise RuntimeError("Dimension created, but precision could not be set.")
+                    entry.update(dimension=str(value(param, "FullName")), prefix=display.GetText(1), status="applied")
+                except Exception as exc:
+                    failure = {"index": index, "name": item.name, "view_name": item.view_name,
+                               "message": str(exc)}
+                    break
+        if mutated:
+            try:
+                require_document_path(str(args["expected_document_path"]), 3)
+                rebuild_ok = bool(rebuild(doc))
+                if not rebuild_ok:
+                    raise RuntimeError("Drawing rebuild failed after dimension changes.")
+                fresh: dict[str, dict[str, list[Any]]] = {}
+                for entry in created:
+                    if entry["status"] != "applied":
+                        continue
+                    item = prepared[entry["index"]]
+                    if item.view_name not in fresh:
+                        view = find_view(doc, item.view_name)
+                        if str(value(view, "ReferencedConfiguration")) != item.configuration:
+                            raise RuntimeError("View configuration changed during rebuild.")
+                        by_name: dict[str, list[Any]] = {}
+                        for display in dimensions(view):
+                            name = str(value(display.GetDimension2(0), "Name")).split('@')[0]
+                            by_name.setdefault(name, []).append(display)
+                        fresh[item.view_name] = by_name
+                    matches = fresh[item.view_name].get(item.name, [])
+                    if len(matches) != 1:
+                        raise RuntimeError(f"Dimension '{item.name}' did not persist uniquely after rebuild.")
+                    display = matches[0]
+                    param = display.GetDimension2(0)
+                    measured = to_mm(value(param, "SystemValue"))
+                    if not math.isfinite(measured) or abs(measured-item.expected) > item.tolerance:
+                        raise RuntimeError(f"Dimension '{item.name}' differs after rebuild.")
+                    dangling = value(value(display, "GetAnnotation"), "IsDangling")
+                    if dangling is None or bool(dangling):
+                        raise RuntimeError(f"Dimension '{item.name}' is dangling or its association could not be verified.")
+                    entry.update(dimension=str(value(param, "FullName")), measured_mm=measured, status="verified")
+            except Exception as exc:
+                failure = {**(failure or {}), "verification_error": str(exc)}
     finally:
         clear_selection(doc)
+
+    if failure is not None:
+        message = failure.get("message", failure.get("verification_error", "Dimension verification failed."))
+        data = {"changed": mutated, "partial": mutated, "created": created, "failed": failure,
+                "rebuild_ok": rebuild_ok, "rollback_performed": False, "may_have_changes": mutated}
+        if not batch:
+            data.update({k: failure[k] for k in ("measured_mm", "removed", "created_dimension") if k in failure})
+        return result(False, message, **data)
+    if not batch:
+        entry = created[0]
+        return result(True, "Created measured drawing dimension.", dimension=entry["dimension"],
+                      measured_mm=entry["measured_mm"], prefix=entry["prefix"])
+    return result(True, f"Created {len(created)} measured drawing dimensions.", changed=True,
+                  dimensions=created, count=len(created), rebuild_ok=rebuild_ok)
 
 
 @tool("set_drawing_sheet", "Set the sheet scale and optionally reuse an existing sheet-format file. Does not copy title metadata, save, or resize drawing text. Set each view scale explicitly with set_drawing_view.",
